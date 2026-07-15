@@ -3,7 +3,8 @@
 # Architecture: frozen VGGT runs separately on t1 and t3 endpoints.
 # f1 features (t1 canvas) are updated by a temporal transformer that attends
 # to f3 features via self-attention (t1 tokens) + cross-attention (to t3) + MLP.
-# Output is added back to f1 through a per-layer gate (init=0 → identity at start).
+# Transformer output is converted to a delta by subtracting its input query.
+# The delta is added to f1 through a small per-layer gate (init=1e-3).
 #
 # No learnable t2 query tokens. No adapter projections. Transformer operates
 # at VGGT dim D=2C=2048 directly. Teacher targets must match t1 camera views.
@@ -123,4 +124,3 @@ model_kwargs:
 
   # Memory
   use_gradient_checkpoint: true      # gradient-checkpoint temporal transformer blocks
-

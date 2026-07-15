@@ -9,7 +9,7 @@ Architecture:
           - Self-attention over f1 tokens with optional 2D RoPE (S frames × T tokens).
           - Cross-attention from f1 to f3.
           - MLP.
-     d. Gated residual: out = f1 + gate[layer] * transformer_output.
+     d. Gated residual: out = f1 + gate[layer] * (transformer_output - query).
   3. Feed the 4 updated cached features to VGGT DPTHead.
 
 Key differences from temporal_vggt_temporal_transformer:
@@ -145,8 +145,9 @@ class TemporalResidualEndpoint(nn.Module):
     """VGGT endpoint features + gated residual temporal transformer for t2 prediction.
 
     f1 features serve as the query canvas; f3 features serve as key/value memory.
-    The temporal transformer output is added to f1 through a per-layer learnable
-    gate (initialized to 0 → identity at training start).
+    The temporal transformer uses normal internal residuals, so its output is
+    converted to an explicit delta by subtracting the input query. That delta is
+    added to the original f1 feature through a small per-layer gate.
 
     Args:
         vggt_model_id:              HuggingFace model id or local path for VGGT.
@@ -285,9 +286,9 @@ class TemporalResidualEndpoint(nn.Module):
             for _ in range(num_transformer_layers)
         ])
 
-        # --- Per-layer gates (scalar, initialized to 1.0) ---
+        # --- Per-layer gates (small scalar, near-identity start) ---
         self.gates = nn.ParameterList([
-            nn.Parameter(torch.ones(1)) for _ in cache_layers
+            nn.Parameter(torch.full((1,), 1e-3)) for _ in cache_layers
         ])
 
         # --- Point head ---
@@ -562,8 +563,9 @@ class TemporalResidualEndpoint(nn.Module):
                     h = block(h, kv, pos)
             del kv
 
-            # Up-project back to D and gated residual on original f1
-            h = h.reshape(B, S, T, self.d_model)
+            # Convert the transformer's updated hidden state into an explicit
+            # residual branch, then add it to the original VGGT f1 feature.
+            h = (h - q).reshape(B, S, T, self.d_model)
             if self.use_down_proj:
                 h = self.up_projs[idx](self.up_norms[idx](h))  # [B, S, T, D]
             updated_cached.append(f1 + self.gates[idx] * h)
@@ -593,4 +595,3 @@ class TemporalResidualEndpoint(nn.Module):
 
     def total_parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
-
