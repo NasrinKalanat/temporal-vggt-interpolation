@@ -329,12 +329,12 @@ def compute_loss(
 # ─── train / eval loops ───────────────────────────────────────────────────────
 
 def _collate(samples: list) -> dict:
-    """Collate a list of sample dicts; passes None values (skipped images) through."""
+    """Collate sample dicts while preserving mixed cached/uncached images."""
     out: dict = {}
     for k in samples[0]:
         vals = [s[k] for s in samples]
-        if vals[0] is None:
-            out[k] = None
+        if any(v is None for v in vals):
+            out[k] = None if all(v is None for v in vals) else vals
         elif isinstance(vals[0], torch.Tensor):
             out[k] = torch.stack(vals)
         elif isinstance(vals[0], dict):
@@ -805,9 +805,9 @@ def main() -> None:
     live_mode = cfg.get("vggt_inference_mode", "precomputed") == "live"
 
     cache_root = cfg.get("feature_cache_root")
-    feature_cache = VGGTFeatureCache(cache_root) if cache_root else None
+    feature_cache = VGGTFeatureCache.from_config(cache_root, cfg) if cache_root else None
     if feature_cache:
-        log(f"VGGT feature cache: {cache_root}")
+        log(f"VGGT feature cache: {cache_root} namespace={feature_cache.namespace}")
     else:
         log("VGGT feature cache: disabled")
 
@@ -884,4 +884,3 @@ def main() -> None:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()
-

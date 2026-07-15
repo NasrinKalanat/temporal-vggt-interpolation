@@ -48,6 +48,7 @@ from models.time_encoding import (
     apply_film,
     build_relative_gap_features,
 )
+from models.feature_cache_utils import run_cached_endpoint
 from models.lora import apply_lora_to_dpt_head
 
 logger = logging.getLogger(__name__)
@@ -387,51 +388,17 @@ class TemporalResidualEndpoint(nn.Module):
 
     def _run_vggt_endpoints(
         self,
-        images_t1: torch.Tensor,  # [B, S1, 3, H, W]
-        images_t3: torch.Tensor,  # [B, S3, 3, H, W]
+        images_t1,
+        images_t3,
         B: int,
-        S1: int,
-        S3: int,
-        t1_key: str | None = None,
-        t3_key: str | None = None,
+        t1_key=None,
+        t3_key=None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Run frozen VGGT on t1 and t3, with disk cache and single batched pass."""
-        cache = getattr(self, "feature_cache", None)
-        device = next(self.parameters()).device
-
-        def _load(key):
-            if cache is None or key is None:
-                return None
-            feats = cache.get(key)
-            return [f.to(device) for f in feats] if feats is not None else None
-
-        cached_t1 = _load(t1_key)
-        cached_t3 = _load(t3_key)
-
-        t1_miss = cached_t1 is None
-        t3_miss = cached_t3 is None
-
-        if t1_miss and t3_miss:
-            if S1 == S3:
-                combined = torch.cat([images_t1, images_t3], dim=0)
-                all_feats = self._run_vggt_endpoint(combined, 2 * B, S1)
-                cached_t1 = [c[:B] for c in all_feats]
-                cached_t3 = [c[B:] for c in all_feats]
-            else:
-                cached_t1 = self._run_vggt_endpoint(images_t1, B, S1)
-                cached_t3 = self._run_vggt_endpoint(images_t3, B, S3)
-        elif t1_miss:
-            cached_t1 = self._run_vggt_endpoint(images_t1, B, S1)
-        elif t3_miss:
-            cached_t3 = self._run_vggt_endpoint(images_t3, B, S3)
-
-        if cache is not None:
-            if t1_miss:
-                cache.put(t1_key, cached_t1)
-            if t3_miss:
-                cache.put(t3_key, cached_t3)
-
-        return cached_t1, cached_t3
+        """Run frozen VGGT on t1 and t3 with one cache entry per sample."""
+        return (
+            run_cached_endpoint(self, images_t1, B, t1_key, "t1"),
+            run_cached_endpoint(self, images_t3, B, t3_key, "t3"),
+        )
 
     def _apply_time_cond(
         self,
@@ -467,10 +434,8 @@ class TemporalResidualEndpoint(nn.Module):
         """
         device = next(self.parameters()).device
 
-        raw_t1 = batch["images_t1"]
-        raw_t3 = batch["images_t3"]
-        images_t1 = raw_t1.to(device) if raw_t1 is not None else None
-        images_t3 = raw_t3.to(device) if raw_t3 is not None else None
+        images_t1 = batch["images_t1"]
+        images_t3 = batch["images_t3"]
         B = batch["date_t1"].shape[0]
         H = W = 518  # VGGT always preprocesses to this size; used only for mock_images
 
@@ -487,12 +452,8 @@ class TemporalResidualEndpoint(nn.Module):
         # --- Frozen VGGT endpoint pass (cache-aware) ---
         t1_key = batch.get("t1_cache_key")
         t3_key = batch.get("t3_cache_key")
-        if isinstance(t1_key, list): t1_key = t1_key[0]
-        if isinstance(t3_key, list): t3_key = t3_key[0]
         cached_t1, cached_t3 = self._run_vggt_endpoints(
             images_t1, images_t3, B,
-            images_t1.shape[1] if images_t1 is not None else 0,
-            images_t3.shape[1] if images_t3 is not None else 0,
             t1_key=t1_key, t3_key=t3_key,
         )
 

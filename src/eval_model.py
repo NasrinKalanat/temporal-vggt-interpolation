@@ -516,9 +516,11 @@ def evaluate_sample(
 
     if model is not None:
         # Build a single-sample batch (same structure as DataLoader output).
+        images_t1 = sample["images_t1"]
+        images_t3 = sample["images_t3"]
         batch = {
-            "images_t1": sample["images_t1"].unsqueeze(0).to(device),  # [1, V1, 3, H, W]
-            "images_t3": sample["images_t3"].unsqueeze(0).to(device),
+            "images_t1": images_t1.unsqueeze(0).to(device) if images_t1 is not None else None,
+            "images_t3": images_t3.unsqueeze(0).to(device) if images_t3 is not None else None,
             "t1_cache_key": sample.get("t1_cache_key"),
             "t3_cache_key": sample.get("t3_cache_key"),
             "camera_t1": {k: v.unsqueeze(0) for k, v in sample["camera_t1"].items()},
@@ -778,8 +780,11 @@ def main() -> None:
     _log_device_info(device)
 
     cache_root = cfg.get("feature_cache_root")
-    feature_cache = VGGTFeatureCache(cache_root) if cache_root else None
-    log(f"VGGT feature cache: {cache_root or 'disabled'}")
+    feature_cache = VGGTFeatureCache.from_config(cache_root, cfg) if cache_root else None
+    log(
+        f"VGGT feature cache: {cache_root or 'disabled'}"
+        + (f" namespace={feature_cache.namespace}" if feature_cache else "")
+    )
 
     log("Scanning vggt_output_root...")
     dataset = TemporalTripletDataset(
@@ -882,4 +887,3 @@ def _print_summary(all_results: list[dict]) -> None:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()
-

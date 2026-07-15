@@ -31,6 +31,7 @@ from losses.pointmap_loss import temporal_vggt_pointmap_loss
 from losses.cache_loss import cached_feature_loss
 from losses.camera_loss import camera_loss_t2q
 from loto import build_loto_folds, load_triplets
+from models.feature_cache_utils import run_cached_endpoint
 
 
 # ─── DDP setup / teardown ─────────────────────────────────────────────────────
@@ -209,8 +210,8 @@ def _collate(samples: list) -> dict:
     out: dict = {}
     for k in samples[0]:
         vals = [s[k] for s in samples]
-        if vals[0] is None:
-            out[k] = None
+        if any(v is None for v in vals):
+            out[k] = None if all(v is None for v in vals) else vals
         elif isinstance(vals[0], torch.Tensor):
             out[k] = torch.stack(vals)
         elif isinstance(vals[0], dict):
@@ -332,30 +333,15 @@ def resolve_t2_teacher_cached(
     device: str,
 ) -> list[torch.Tensor] | None:
     """Load or compute t2 teacher cached layers, caching to disk on first use."""
-    cache = getattr(model, "feature_cache", None)
-    t2_key = batch.get("t2_cache_key")
-    if isinstance(t2_key, list):
-        t2_key = t2_key[0]
-
-    if cache is not None and t2_key is not None:
-        feats = cache.get(t2_key)
-        if feats is not None:
-            return [f.to(device) for f in feats]
-
     if not hasattr(model, "_run_vggt_endpoint") or model.aggregator is None:
         return None
-    images_t2 = batch.get("images_t2")
-    if images_t2 is None:
-        return None
-    images_t2 = images_t2.to(device)
-    B, S = images_t2.shape[:2]
-    with torch.no_grad():
-        feats = model._run_vggt_endpoint(images_t2, B, S)
-
-    if cache is not None and t2_key is not None:
-        cache.put(t2_key, feats)
-
-    return [f.to(device) for f in feats]
+    return run_cached_endpoint(
+        model,
+        batch.get("images_t2"),
+        batch["date_t1"].shape[0],
+        batch.get("t2_cache_key"),
+        "t2",
+    )
 
 
 # ─── loss ─────────────────────────────────────────────────────────────────────
@@ -804,9 +790,9 @@ def main(local_rank: int, world_size: int) -> None:
     live_mode = cfg.get("vggt_inference_mode", "precomputed") == "live"
 
     cache_root = cfg.get("feature_cache_root")
-    feature_cache = VGGTFeatureCache(cache_root) if cache_root else None
+    feature_cache = VGGTFeatureCache.from_config(cache_root, cfg) if cache_root else None
     if feature_cache:
-        log(f"VGGT feature cache: {cache_root}")
+        log(f"VGGT feature cache: {cache_root} namespace={feature_cache.namespace}")
 
     if live_mode:
         from vggt_pipeline.execute_vggt import get_vggt_runner

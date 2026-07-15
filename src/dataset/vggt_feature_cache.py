@@ -10,7 +10,7 @@ Cache key derivation (no file I/O):
   For t3: key = "{t3_date}_{crop}_t3v{t3v}"
     — t3 images are determined solely by the t3 view index.
 
-Cache file = {cache_root}/{key}.pt
+Cache file = {cache_root}/{namespace}/{key}.pt
 Features   = list of 4 CPU bfloat16 tensors, one per cache layer.
 
 Writes are atomic (temp file + os.replace) so multiple training processes
@@ -20,16 +20,36 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 
 class VGGTFeatureCache:
 
-    def __init__(self, cache_root: str | Path):
+    def __init__(self, cache_root: str | Path, namespace: str | None = None):
         self.cache_root = Path(cache_root)
+        self.namespace = self._sanitize(namespace) if namespace else None
         self.cache_root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _sanitize(value: str) -> str:
+        safe = "".join(c if c.isalnum() or c in ".-_" else "-" for c in str(value))
+        return safe.strip(".-_") or "default"
+
+    @classmethod
+    def from_config(cls, cache_root: str | Path, cfg: dict[str, Any]) -> "VGGTFeatureCache":
+        model_kwargs = cfg.get("model_kwargs", {})
+        cache_layers = model_kwargs.get("cache_layers", [4, 11, 17, 23])
+        layer_tag = "-".join(str(layer) for layer in cache_layers)
+        namespace = cls._sanitize(
+            "model-"
+            f"{model_kwargs.get('vggt_model_id', cfg.get('vggt_model_id', 'facebook/VGGT-1B'))}"
+            f"__prep-{cfg.get('image_preprocess_mode', 'pad')}"
+            f"__img-{cfg.get('image_size', 518)}"
+            f"__layers-{layer_tag}"
+        )
+        return cls(cache_root, namespace=namespace)
 
     # ── key ───────────────────────────────────────────────────────────────────
 
@@ -80,17 +100,21 @@ class VGGTFeatureCache:
             # t1t2_paired: variant_{t2v}_{t3v}
             t2v, t3v = indices
             if endpoint == "t1":
-                return f"{t1_date}_{crop}_pair{t2v:02d}"
+                base = f"{t1_date}_{crop}_pair{t2v:02d}"
             elif endpoint == "t2":
-                return f"{t2_date}_{crop}_t2_pair{t2v:02d}"
-            return f"{t3_date}_{crop}_t3v{t3v:02d}"
+                base = f"{t2_date}_{crop}_t2_pair{t2v:02d}"
+            else:
+                base = f"{t3_date}_{crop}_t3v{t3v:02d}"
         else:
             # camera_consistent: variant_{n}
             v = indices[0]
             if endpoint == "t2":
-                return f"{t2_date}_{crop}_v{v:03d}_t2"
-            date = t1_date if endpoint == "t1" else t3_date
-            return f"{date}_{crop}_v{v:03d}_{endpoint}"
+                base = f"{t2_date}_{crop}_v{v:03d}_t2"
+            else:
+                date = t1_date if endpoint == "t1" else t3_date
+                base = f"{date}_{crop}_v{v:03d}_{endpoint}"
+
+        return f"{self.namespace}/{base}" if self.namespace else base
 
     # ── path ──────────────────────────────────────────────────────────────────
 
@@ -134,4 +158,3 @@ class VGGTFeatureCache:
                 tmp.unlink()
             except Exception:
                 pass
-
