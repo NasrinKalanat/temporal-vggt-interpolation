@@ -34,6 +34,7 @@ freeze_point_head: true
 # Training loop
 # ---------------------------------------------------------------------------
 epochs: 50
+resume: false
 batch_size: 1
 num_workers: 2
 val_every: 1

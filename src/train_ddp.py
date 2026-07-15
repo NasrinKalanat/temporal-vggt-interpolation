@@ -106,6 +106,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_module": "models.temporal_vggt_v1",
     "model_class": "TemporalVGGTv1",
     "model_kwargs": {},
+    "resume": False,
     "epochs": 50,
     "batch_size": 1,
     "num_workers": 2,
@@ -673,9 +674,10 @@ def _train_fold_inner(
     history: list[dict] = []
     start_epoch = 1
 
-    # Resume from checkpoint (all ranks load independently)
+    # Resume from checkpoint only when explicitly enabled.
     resume_path = output_dir / "last_checkpoint.pt"
-    if resume_path.exists():
+    resume_enabled = cfg.get("resume", False)
+    if resume_enabled and resume_path.exists():
         log(f"  resuming from {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
@@ -687,6 +689,8 @@ def _train_fold_inner(
         history        = ckpt.get("history", [])
         log(f"  resumed at epoch {start_epoch}/{total_epochs}  best_val={best_val_loss:.6f} (ep {best_epoch})")
     else:
+        if resume_path.exists() and not resume_enabled:
+            log(f"  resume disabled; ignoring existing checkpoint {resume_path}")
         ckpt_path = cfg.get("init_checkpoint")
         if ckpt_path is not None:
             state = torch.load(Path(ckpt_path), map_location=device, weights_only=True)
@@ -888,4 +892,3 @@ if __name__ == "__main__":
         main(local_rank, world_size)
     finally:
         cleanup_ddp()
-
