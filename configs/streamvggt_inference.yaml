@@ -1,0 +1,17 @@
+paired_triplets_path: prepared_data/t1t2_paired_triplets.json
+output_root: vggt_outputs/streamvggt_v16_o8
+ckpt_path: /mnt/data/StreamVGGT/ckpt/checkpoints.pth
+
+# Same windowing as the VGGT pipeline
+n_views: 16
+max_overlap_views: 8
+max_t1t2_windows: null
+t3_variants_per_window: 5
+
+crops: corn
+triplet_ids: null
+seed: 42
+device: cuda:0
+skip_existing: true
+point_map_only: true
+

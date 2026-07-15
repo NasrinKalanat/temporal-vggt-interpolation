@@ -1,0 +1,61 @@
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+subset_manifest: prepared_data/subsets/benchmark_subset.json
+
+# Root of VGGT inference outputs (images loaded via selected_images.json,
+# supervision loaded from predictions/point_map.npy etc.)
+vggt_output_root: vggt_output
+
+output_root: runs
+eval_output_root: evaluation
+
+protocols:
+  - target_date
+  - strict
+
+crops:
+  - corn
+  - soybean
+
+# Train only the fold where this date is the held-out test date.
+# Omit (or set to null) to train all folds.
+test_date: "20230822"
+
+seed: 42
+
+# Minimum point confidence score to include a point in the loss mask.
+conf_threshold: 0.02
+
+# Image preprocessing mode passed to vggt.utils.load_fn.load_and_preprocess_images.
+# "pad" preserves all pixels; "crop" sets width to 518px and center-crops height.
+image_preprocess_mode: pad
+
+# --- Model ---
+model_module: models.temporal_vggt_old
+model_class: TemporalVGGT
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  num_target_views: 32
+  target_query_grid: [16, 16]
+  gap_scale: 365.0
+  lora_layers: [18, 19, 20, 21, 22, 23]
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  film_layers: [20, 21, 22, 23]
+  film_hidden_dim: 256
+  max_encoder_views: 32
+  gradient_checkpointing: false     # recompute decoder activations during backward to save memory
+
+# --- Training ---
+lr: 1.0e-4
+epochs: 50
+batch_size: 1
+num_workers: 2
+val_every: 5
+
+device: cuda:0
+
+# --- Evaluation ---
+distance_threshold: 0.05
+voxel_size: 0.05
+

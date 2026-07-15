@@ -1,0 +1,121 @@
+# Temporal-VGGT TemporalTransformer training config
+#
+# Architecture: frozen VGGT runs separately on t1 and t3 endpoints.
+# t2 features are built from per-layer learnable query tokens (at D=2C=2048 directly,
+# no adapter projection) updated by a temporal transformer that attends to t1+t3:
+#   self-attention (2D RoPE over Q frames × T tokens) + cross-attention + MLP.
+#
+# No gated residual. Transformer output IS the t2 cached features sent to DPTHead.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/camera_consistent_triplets_v16_o4
+output_root: runs/temporal_transformer_camera_consistent_triplets_v16_o4_adaln_1layer
+
+vggt_inference_mode: precomputed
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+image_preprocess_mode: pad
+conf_threshold: 0.02
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+epochs: 50
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+early_stopping:
+  patience: 15
+  min_delta: 1.0e-4
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# LR scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  warmup_epochs: 2
+  min_lr: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# Point-map loss
+# ---------------------------------------------------------------------------
+loss:
+  alpha: 0.2
+  lambda_grad: 1.0
+  use_gradient_loss: true
+  pred_conf_clamp_min: 1.0e-6
+  pred_conf_clamp_max: 100.0
+
+# ---------------------------------------------------------------------------
+# Teacher confidence handling
+# ---------------------------------------------------------------------------
+teacher:
+  conf_mask_threshold: 0.02
+  conf_threshold_type: absolute
+  use_weighted_reg_loss: false
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_module: models.temporal_vggt_temporal_transformer
+model_class: TemporalVGGTTemporalTransformer
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024             # VGGT-1B token dim; D = 2C = 2048 (do not change)
+
+  num_query_views: 16         # must match n_views used when generating teacher outputs
+
+  # Temporal transformer
+  # Operates at D=2048. num_transformer_heads must divide 2048.
+  # 16 heads → head_dim=128  (recommended)
+  #  8 heads → head_dim=256  (cheaper)
+  num_transformer_layers: 1
+  num_transformer_heads: 16
+  mlp_ratio: 4.0
+  dropout: 0.0
+
+  # Time conditioning (applied to f1, f3, and learnable t2q before transformer)
+  time_conditioning_mode: residual_adaln    # "additive" | "film" | "residual_adaln"
+                                      # additive:      x += MLP(role+date+gap), zero-init → identity
+                                      # film:          x * (1+gamma) + beta, zero-init → identity
+                                      # residual_adaln: x + alpha*AdaLN(x,gamma,beta), alpha=0 init
+  time_hidden_dim: 256                # hidden dim of SharedTimeEncoder MLP
+
+  # Spatial attention
+  use_rope_in_self_attention: true    # 2D RoPE over Q×T grid in t2q self-attention
+
+  # Point head
+  init_point_head_from_vggt: true     # initialize DPTHead from pretrained VGGT weights
+  cache_layers: [4, 11, 17, 23]       # exactly 4 entries required for DPTHead
+
+  # Memory
+  use_gradient_checkpoint: false      # gradient-checkpoint temporal transformer blocks
+
+  # Gated residual from t1
+  add_t1_to_transformer: false        # true: output = f1 + gate * transformer(t2q), gate init=0
+                                      # false: output = transformer(t2q) [default]
+                                      # requires num_query_views == number of t1 input views
+

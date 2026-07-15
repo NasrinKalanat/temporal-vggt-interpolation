@@ -1,0 +1,124 @@
+# Temporal-VGGT v3 training config
+# Fully frozen VGGT + cross-attention fusion.
+# VGGT runs independently on t1 and t3; time-conditioned outputs are fused
+# via cross-attention where Q = t2 time embedding, K/V = concat(t1, t3) features.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/all_triplets_v16_o4
+output_root: runs/model_v3_all_triplets_v16_o4_adaln_learnable_grid_pm_head
+
+# ---------------------------------------------------------------------------
+# VGGT inference mode
+# ---------------------------------------------------------------------------
+vggt_inference_mode: precomputed   # "precomputed" | "live"
+# When vggt_inference_mode: live, set these:
+# all_triplets_path: prepared_data/all_triplets.json
+# vggt_device: cuda:1
+# vggt_model_id: facebook/VGGT-1B
+# n_views: 8
+# max_overlap_views: 2
+# max_variants: null
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+image_preprocess_mode: pad
+conf_threshold: 0.02
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+epochs: 50
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+gradient_checkpointing: false
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+early_stopping:
+  patience: 15
+  min_delta: 1.0e-4
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# LR scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  warmup_epochs: 2
+  min_lr: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# Point-map loss
+# ---------------------------------------------------------------------------
+loss:
+  alpha: 0.2
+  lambda_grad: 1.0
+  use_gradient_loss: true
+  pred_conf_clamp_min: 1.0e-6
+  pred_conf_clamp_max: 100.0
+
+# ---------------------------------------------------------------------------
+# Teacher confidence handling
+# ---------------------------------------------------------------------------
+teacher:
+  conf_mask_threshold: 0.02
+  conf_threshold_type: absolute
+  use_weighted_reg_loss: false
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_module: models.temporal_vggt_v3
+model_class: TemporalVGGTv3
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024
+  num_query_views: 16   # used by dataset only; model derives Q=V1 from batch at runtime
+  query_patch_h: 37
+  query_patch_w: 37
+  query_grid_std: 0.001
+  time_conditioning_mode: residual_adaln          # "film" | "residual_adaln"
+  t2_query_mode: learnable_grid         # "broadcast" | "learnable_grid" | "factorized_grid"
+  # Exactly 4 indices into the 24 VGGT intermediate outputs (matches DPTHead's 4-scale design).
+  # Default [4, 11, 17, 23] matches DPTHead's own default.
+  intermediate_layer_idx: [4, 11, 17, 23]
+  attn_heads: 8
+  attn_dropout: 0.0
+  init_point_head_from_vggt: true
+  use_camera_head: false
+  init_camera_head_from_vggt: false
+  freeze_point_head: false
+  freeze_camera_head: false
+  camera_conditioning_mode: additive         # "none" | "film" | "residual_adaln" | "additive"
+  time_hidden_dim: 128                       # hidden dim for SharedTimeEncoder (default: embed_dim)
+  camera_hidden_dim: 128                     # hidden dim for camera conditioning (default: embed_dim)
+
+# ---------------------------------------------------------------------------
+# Camera pose loss (active when init_camera_head_from_vggt: true)
+# ---------------------------------------------------------------------------
+camera_loss:
+  lambda_camera: 0.1
+  gamma: 0.6
+  weight_trans: 1.0
+  weight_rot: 1.0
+  weight_focal: 0.5
+

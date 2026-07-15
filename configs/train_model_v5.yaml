@@ -1,0 +1,100 @@
+# Temporal-VGGT v5 training config
+# Full VGGT aggregator with TimeCrossBlock injected at the final layer.
+# All 2S+Q frames (t1 + t2-query + t3) run jointly through frozen VGGT frame/global blocks.
+# t2 query frames use a learned mask_patch_token (no RGB input).
+# TimeCrossBlock at layer 23 updates t2 query tokens from t1+t3 context.
+# DPTHead is initialized from pretrained VGGT and fine-tuned.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/camera_consistent_triplets_v16_o4
+output_root: runs/model_v5
+
+# ---------------------------------------------------------------------------
+# VGGT inference mode
+# ---------------------------------------------------------------------------
+vggt_inference_mode: precomputed   # v5 always runs the aggregator; precomputed not supported
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+image_preprocess_mode: pad
+conf_threshold: 0.02
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+epochs: 50
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+gradient_checkpointing: true
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+early_stopping:
+  patience: 15
+  min_delta: 1.0e-4
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# LR scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  warmup_epochs: 2
+  min_lr: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# Point-map loss
+# ---------------------------------------------------------------------------
+loss:
+  alpha: 0.2
+  lambda_grad: 1.0
+  use_gradient_loss: true
+  pred_conf_clamp_min: 1.0e-6
+  pred_conf_clamp_max: 100.0
+
+# ---------------------------------------------------------------------------
+# Teacher confidence handling
+# ---------------------------------------------------------------------------
+teacher:
+  conf_mask_threshold: 0.02
+  conf_threshold_type: absolute
+  use_weighted_reg_loss: false
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_module: models.temporal_vggt_v5
+model_class: TemporalVGGTv5
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024
+  num_query_views: 16
+  time_conditioning_mode: residual_adaln     # "film" | "residual_adaln"
+  camera_conditioning_mode: none             # "none" | "film" | "residual_adaln" | "additive"
+  time_hidden_dim: 128
+  camera_hidden_dim: 256
+  time_block_layer: 23                       # aggregator layer where TimeCrossBlock is injected
+  time_block_heads: 8
+  time_block_dropout: 0.0
+  cache_layers: [4, 11, 17, 23]             # must have exactly 4 entries; time_block_layer must be in this list
+  init_point_head_from_vggt: true            # initialize DPTHead from pretrained VGGT
+

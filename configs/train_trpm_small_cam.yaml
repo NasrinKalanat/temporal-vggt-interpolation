@@ -1,0 +1,40 @@
+vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+output_root: runs/trpm_small_cam_clean
+
+protocols: [strict]
+crops: [corn]
+test_date: "20230831"
+val_date: "20230817"
+
+seed: 42
+epochs: 100
+batch_size: 1
+num_workers: 4
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+
+conf_threshold: 1.0000001
+preprocess_cache_dir: vggt_outputs/preprocess_cache
+pred_conf_threshold: 0.02
+
+model_class: trpm.trpm_small_cam.TRPMSmallCam
+model_kwargs:
+  num_t3_points: 8192
+  cond_dim: 192
+
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+
+scheduler:
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+loss:
+  lambda_chamfer: 0.05
+  lambda_res: 0.01
+  lambda_gate: 0.001
+  chamfer_warmup_epoch: 5
+

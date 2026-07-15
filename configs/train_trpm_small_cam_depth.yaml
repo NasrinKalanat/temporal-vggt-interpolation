@@ -1,0 +1,35 @@
+# TRPM-Small-Cam-Depth training config
+model_class: "trpm.trpm_small_cam_depth.TRPMSmallCamDepth"
+vggt_output_root: "vggt_outputs/t1t2_paired_v16_o8"
+triplets_path: "prepared_data/subsets/benchmark_triplets.json"
+output_root: "runs/trpm_small_cam_depth"
+protocols: ["strict"]
+crops: ["corn"]
+test_date: "20230831"
+conf_threshold: 0.02
+pred_conf_threshold: 0.02
+seed: 42
+epochs: 100
+batch_size: 1
+num_workers: 4
+val_every: 5
+grad_clip: 1.0
+model_kwargs:
+  num_t3_points: 10240
+  cond_dim: 192
+  conf_threshold: 0.02
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.01
+scheduler:
+  warmup_epochs: 5
+  min_lr: 0.000001
+loss:
+  depth_mode: "depth_only"
+  lambda_chamfer: 0.05
+  lambda_depth: 0.1
+  lambda_res: 0.01
+  lambda_gate: 0.001
+  conf_threshold: 0.02
+  chamfer_warmup_epoch: 11
+

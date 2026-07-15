@@ -1,0 +1,122 @@
+# Temporal-VGGT v1 training config
+# All keys are read directly by src/train.py.
+# model_kwargs keys must match TemporalVGGTv1.__init__ parameter names exactly.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/all_triplets_v16_o4
+output_root: runs/model_v1_all_triplets
+
+# ---------------------------------------------------------------------------
+# VGGT inference mode
+# ---------------------------------------------------------------------------
+vggt_inference_mode: live   # "precomputed" | "live"
+# When vggt_inference_mode: live, set these:
+all_triplets_path: prepared_data/all_triplets.json
+vggt_device: cuda:1        # separate device for VGGT (can differ from training device)
+# vggt_model_id: facebook/VGGT-1B
+n_views: 16                 # sliding window size (views per VGGT call)
+max_overlap_views: 4       # overlap between consecutive windows
+max_variants: 20         # cap variants per triplet (null = no cap)
+# NOTE: live mode forces num_workers=0 and skips patch embedding cache
+
+protocols:
+  # - target_date
+  - strict
+
+# v1 trains one model per crop (no crop conditioning token).
+# Run once with crops: [corn] and once with crops: [soybean].
+crops:
+  - corn
+  # - soybean
+
+# Hold out this date as the LOTO test date. Set to null to train all folds.
+test_date: "20230831"
+
+seed: 42
+image_preprocess_mode: pad
+conf_threshold: 0.02          # base mask: exclude teacher points below this confidence
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+epochs: 50
+batch_size: 1
+num_workers: 2
+val_every: 5
+device: cuda:0
+grad_clip: 1.0
+
+# ---------------------------------------------------------------------------
+# Early stopping (requires val_loader; disabled if no validation data)
+# ---------------------------------------------------------------------------
+early_stopping:
+  patience: 3          # consecutive val checks without improvement → stop
+  min_delta: 1.0e-4    # minimum decrease in val loss_pointmap to count as improvement
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# LR scheduler (cosine annealing with linear warmup)
+# ---------------------------------------------------------------------------
+scheduler:
+  warmup_epochs: 2
+  min_lr: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# Point-map loss
+# ---------------------------------------------------------------------------
+loss:
+  alpha: 0.2                    # weight for -alpha * log(C_pred) regularizer
+  lambda_grad: 1.0              # weight for gradient consistency term
+  use_gradient_loss: true
+  pred_conf_clamp_min: 1.0e-6
+  pred_conf_clamp_max: 100.0
+
+# ---------------------------------------------------------------------------
+# Camera pose loss (only active when model_kwargs.use_camera_head: true)
+# ---------------------------------------------------------------------------
+camera_loss:
+  lambda_camera: 0.1             # weight: total = loss_pointmap + lambda_camera * loss_camera
+  gamma: 0.6                     # stage decay; earlier refinement iterations weighted less
+  weight_trans: 1.0
+  weight_rot: 1.0
+  weight_focal: 0.5
+
+# ---------------------------------------------------------------------------
+# Teacher confidence handling
+# ---------------------------------------------------------------------------
+teacher:
+  conf_mask_threshold: 0.02      # quantile/absolute threshold to mask low-conf teacher points
+  conf_threshold_type: absolute  # "quantile" or "absolute"
+  use_weighted_reg_loss: false   # weight point regression by teacher confidence
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_module: models.temporal_vggt_v1
+model_class: TemporalVGGTv1
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024
+  num_query_views: 1
+  query_patch_h: 37             # 518 // 14 = 37 for VGGT default resolution
+  query_patch_w: 37
+  query_grid_std: 0.02
+  time_conditioning_mode: residual_adaln
+  lora_rank: 4
+  lora_alpha: 8.0
+  lora_dropout: 0.05
+  lora_frame_layers: [20, 21, 22, 23]
+  lora_global_layers: [16, 17, 18, 19, 20, 21, 22, 23]
+  init_point_head_from_vggt: false
+  use_camera_conditioning: false
+  use_camera_head: true
+

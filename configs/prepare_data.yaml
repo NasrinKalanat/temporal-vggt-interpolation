@@ -1,0 +1,23 @@
+dataset_root: /mnt/data/canopy_data
+output_root: prepared_data
+
+selected_dates:
+  - "20230812"  # corn only; soybean matic starts 20230817
+  - "20230817"
+  - "20230822"
+  - "20230827"
+  - "20230831"
+  - "20230906"
+  - "20230911"
+  - "20230917"
+  - "20230922"
+
+selected_crops:
+  - corn
+
+selected_platforms:
+  - matic
+
+random_seed: 42
+build_roi: true
+

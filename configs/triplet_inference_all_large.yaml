@@ -1,0 +1,29 @@
+all_triplets_path: prepared_data/all_triplets.json
+output_root: vggt_outputs/all_triplets_v16_o4_large
+
+# Limit to specific triplet IDs (e.g. "20230812_20230817_20230822_corn"). null = all.
+triplet_ids: null
+
+# Limit to specific crop types (e.g. [corn] or [corn, soybean]). null = all.
+crops: corn
+
+# Views per variant (sliding window size).
+n_views: 16
+
+# Max shared views between consecutive variants. 0 = non-overlapping.
+max_overlap_views: 4
+
+# Cap number of variants generated per triplet entry. null = all variants.
+max_variants: 80
+
+model_id: facebook/VGGT-1B
+device: cuda:0
+image_preprocess_mode: pad
+
+# Skip variants where all three date predictions already exist.
+skip_existing: true
+
+# Only run VGGT inference for t2 (the prediction target).
+# t1 and t3 camera metadata is still written (needed by the dataset) but no
+# VGGT forward pass is run for them — saves ~2/3 of inference compute.
+t2_only: false

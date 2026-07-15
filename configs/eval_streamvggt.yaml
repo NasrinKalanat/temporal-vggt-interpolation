@@ -1,0 +1,20 @@
+# Evaluate baselines on StreamVGGT point maps
+# (same metrics as VGGT, but using StreamVGGT as the 3D backbone)
+
+vggt_output_root: vggt_outputs/streamvggt_v16_o8
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+output_root: evaluation/streamvggt_baselines
+
+protocols: [strict]
+crops: [corn]
+
+seed: 42
+conf_threshold: 0.02
+pred_conf_threshold: 0.02
+n_points: 50000
+distance_threshold: 0.05
+voxel_size: 0.05
+eval_alpha: 0.5
+eval_beta: 0.5
+device: cuda:0
+

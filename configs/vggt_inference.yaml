@@ -1,0 +1,24 @@
+dataset_manifest: prepared_data/manifests/dataset_manifest.json
+subset_manifest: prepared_data/subsets/benchmark_subset.json
+output_root: vggt_output_8_views
+
+# Set to a list of scene_ids to run only specific scenes, or leave null for all benchmark scenes.
+scene_ids: null
+
+# Number of views to sample per scene. VGGT has a 512-view limit on consumer GPUs.
+n_views: 8
+
+# Max allowed overlap between any two view batches when generating multiple batches per scene.
+# 0 = non-overlapping (floor(n_frames/n_views) batches).
+# 16 = sliding window with stride 16 (~2x more batches vs non-overlapping).
+max_overlap_views: 2
+
+seed: 42
+
+model_id: facebook/VGGT-1B
+device: auto
+image_preprocess_mode: pad
+
+# Skip scenes where predictions already exist.
+skip_existing: true
+

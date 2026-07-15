@@ -1,0 +1,38 @@
+vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+output_root: runs/trpm_small
+
+protocols: [strict]
+crops: [corn]
+test_date: "20230831"
+val_date: "20230822"
+
+seed: 42
+epochs: 100
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+
+model_class: trpm.model.TRPMSmall
+model_kwargs:
+  conf_threshold: 0.02
+  num_t3_points: 10240
+  cond_dim: 192
+
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+
+scheduler:
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+loss:
+  conf_threshold: 0.02
+  lambda_chamfer: 0.1
+  lambda_res: 0.01
+  lambda_gate: 0.001
+  chamfer_warmup_epoch: 5
+

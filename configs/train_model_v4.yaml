@@ -1,0 +1,98 @@
+# Temporal-VGGT v4 training config
+# Frozen VGGT endpoint features + masked-query transformer decoder.
+# Single learnable mask_token; N decoder blocks with RoPE self-attn + cross-attn + MLP.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/camera_consistent_triplets_v16_o4
+output_root: runs/model_v4
+
+# ---------------------------------------------------------------------------
+# VGGT inference mode
+# ---------------------------------------------------------------------------
+vggt_inference_mode: precomputed   # "precomputed" | "live"
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+image_preprocess_mode: pad
+conf_threshold: 0.02
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+epochs: 50
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+gradient_checkpointing: true
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+early_stopping:
+  patience: 15
+  min_delta: 1.0e-4
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# LR scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  warmup_epochs: 2
+  min_lr: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# Point-map loss
+# ---------------------------------------------------------------------------
+loss:
+  alpha: 0.2
+  lambda_grad: 1.0
+  use_gradient_loss: true
+  pred_conf_clamp_min: 1.0e-6
+  pred_conf_clamp_max: 100.0
+
+# ---------------------------------------------------------------------------
+# Teacher confidence handling
+# ---------------------------------------------------------------------------
+teacher:
+  conf_mask_threshold: 0.02
+  conf_threshold_type: absolute
+  use_weighted_reg_loss: false
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_module: models.temporal_vggt_v4
+model_class: TemporalVGGTv4
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024
+  num_query_views: 16         # used by dataset only; model derives Q=V1 from batch
+  num_decoder_blocks: 4
+  decoder_heads: 8
+  decoder_mlp_ratio: 4.0
+  decoder_dropout: 0.0
+  time_conditioning_mode: residual_adaln          # "film" | "residual_adaln"
+  camera_conditioning_mode: none        # "none" | "film" | "residual_adaln" | "additive"
+  time_hidden_dim: 128
+  camera_hidden_dim: 256
+  point_head_class: PointHeadLarge      # class name from models.point_heads
+  point_head_kwargs: {}
+

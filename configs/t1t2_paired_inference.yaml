@@ -1,0 +1,40 @@
+paired_triplets_path: prepared_data/t1t2_paired_triplets.json
+output_root: vggt_outputs/t1t2_paired_v16_o8
+
+# Limit to specific entry IDs (e.g. "20230812_20230817_20230822_corn"). null = all.
+triplet_ids: null
+
+# Limit to specific crop types. null = all.
+crops: corn
+
+# Window size: number of views per variant for each of t1, t2, t3.
+n_views: 16
+
+# Max shared views between consecutive t1-t2 windows (stride = n_views - max_overlap_views).
+max_overlap_views: 8
+
+# Cap on sliding windows over t1-t2 pairs per entry. null = all windows.
+max_t1t2_windows: null
+
+# Number of random t3 windows sampled per t1-t2 window.
+# Total variants per entry ≤ max_t1t2_windows × t3_variants_per_window.
+t3_variants_per_window: 5
+
+# Random seed for t3 window sampling (reproducibility).
+seed: 42
+
+model_id: facebook/VGGT-1B
+device: cuda:7
+image_preprocess_mode: pad
+
+skip_existing: true
+
+# Only run VGGT inference for t2; write metadata for t1/t3 without predictions.
+t2_only: false
+
+# Only keep point_map.npy and point_confidence.npy in predictions/; delete all other outputs.
+point_map_only: false
+
+# Aggregator layer indices to cache for t2 (used as supervision targets).
+t2_cache_layers: [4, 11, 17, 23]
+

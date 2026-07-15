@@ -1,0 +1,29 @@
+dataset_manifest: prepared_data/manifests/dataset_manifest.json
+subset_manifest: prepared_data/subsets/benchmark_subset.json
+
+selected_dates:
+  - "20230812"
+  - "20230817"
+  - "20230822"
+  - "20230827"
+  - "20230831"
+  - "20230906"
+  - "20230911"
+  - "20230917"
+  - "20230922"
+
+selected_crops:
+  - corn
+  # - soybean
+
+max_position_distance_m: 0.5
+max_view_angle_deg: 3.0
+max_tilt_difference_deg: 3.0
+max_oblique_yaw_difference_deg: 3.0
+
+use_xy_position_only: false
+one_to_one: true
+max_pairs: null
+
+output_path: prepared_data/t1t2_paired_triplets.json
+
