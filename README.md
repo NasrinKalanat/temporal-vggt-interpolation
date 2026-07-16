@@ -439,3 +439,12 @@ Edge dates (the temporally earliest and latest dates in a crop's sequence) are e
 
 Results are reported per fold (per held-out date) and aggregated over all folds.
 
+torchrun --nproc_per_node=4 src/eval_model.py \
+  --config configs/train_residual_endpoint_adaln_freezed_head.yaml \
+  --runs-root runs/residual_endpoint_t1t2_paired_v16_o8_adaln_1layer_freezed_head_cam \
+  --output-root eval/residual_endpoint_freezed_head \
+  --protocol strict \
+  --crop corn \
+  --test-date 20230831 \
+  --save-clouds
+

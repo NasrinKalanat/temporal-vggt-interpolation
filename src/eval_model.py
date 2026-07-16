@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -34,11 +35,12 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from dataset.triplet_dataset import TemporalTripletDataset
+from dataset.triplet_dataset import TemporalTripletDataset, _load_geometry
 from dataset.vggt_feature_cache import VGGTFeatureCache
 from losses.geometry import compute_metrics
 from loto import build_loto_folds, compute_tau, load_triplets
@@ -70,6 +72,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "vggt_model_id": "facebook/VGGT-1B",
     "vggt_device": "auto",
     "feature_cache_root": "/vast/xjia/nak168/vggt_cache",  # null to disable
+    # Generated on demand when prediction .npy files are missing.
+    "eval_prediction_outputs": ["point_map", "point_confidence", "extrinsic", "intrinsic"],
 }
 
 BASELINES = [
@@ -88,7 +92,37 @@ def _no_collate(x: list) -> Any:
     return x[0]
 
 
+def _is_distributed() -> bool:
+    return "LOCAL_RANK" in os.environ
+
+
+def _setup_distributed() -> tuple[int, int]:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return local_rank, dist.get_world_size()
+
+
+def _cleanup_distributed() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _rank() -> int:
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def _world_size() -> int:
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def _is_main() -> bool:
+    return _rank() == 0
+
+
 def log(msg: str) -> None:
+    if not _is_main():
+        return
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
@@ -259,42 +293,46 @@ def _get_lazy_vggt_runner(model_id: str, device: str) -> Any:
     return _lazy_vggt_runner[key]
 
 
+def ensure_prediction_outputs(
+    date_dir: Path,
+    cfg: dict[str, Any],
+    outputs: list[str] | None = None,
+) -> None:
+    """Generate selected VGGT prediction .npy files if they are missing."""
+    requested = outputs or cfg.get("eval_prediction_outputs", ["point_map", "point_confidence"])
+    pred_dir = date_dir / "predictions"
+    missing = [name for name in requested if not (pred_dir / f"{name}.npy").exists()]
+    if not missing:
+        return
+
+    from vggt_pipeline.execute_vggt import run_vggt_inference_from_image_paths
+
+    selected = json.loads((date_dir / "selected_images.json").read_text())
+    image_paths = [entry["image_path"] for entry in selected]
+    vggt_model_id = cfg.get("vggt_model_id", "facebook/VGGT-1B")
+    vggt_device = cfg.get("vggt_device", "auto")
+    image_preprocess_mode = cfg.get("image_preprocess_mode", "pad")
+    runner = _get_lazy_vggt_runner(vggt_model_id, vggt_device)
+    run_vggt_inference_from_image_paths(
+        image_paths=image_paths,
+        output_dir=date_dir,
+        runner=runner,
+        image_preprocess_mode=image_preprocess_mode,
+        input_image_list_path=date_dir / "input_images.txt",
+        prediction_outputs=missing,
+    )
+
+
 def load_or_infer_pointcloud(
     date_dir: Path,
     conf_threshold: float,
     n_points: int,
     seed: int,
-    vggt_model_id: str = "facebook/VGGT-1B",
-    vggt_device: str = "auto",
-    image_preprocess_mode: str = "pad",
+    cfg: dict[str, Any],
 ) -> np.ndarray:
-    """Load point cloud from pre-computed predictions, or run VGGT live if missing.
-
-    Falls back to live inference when predictions/point_map.npy is absent, which
-    happens for t1/t3 dirs produced by a t2_only inference run.  Image paths are
-    read from the selected_images.json that is always written by run_vggt_inference.
-    """
-    pred_path = date_dir / "predictions" / "point_map.npy"
-    if pred_path.exists():
-        return load_pointmap_cloud(date_dir, conf_threshold, n_points, seed)
-
-    from vggt_pipeline.execute_vggt import run_vggt_inference_in_memory
-    selected = json.loads((date_dir / "selected_images.json").read_text())
-    image_paths = [entry["image_path"] for entry in selected]
-    runner = _get_lazy_vggt_runner(vggt_model_id, vggt_device)
-    preds = run_vggt_inference_in_memory(image_paths, runner, image_preprocess_mode)
-
-    pm = preds["point_map"].numpy()
-    pc = preds["point_confidence"].numpy()
-    if pc.ndim == 4:
-        pc = pc[..., 0]
-    pts = pm.reshape(-1, 3)
-    conf = pc.reshape(-1)
-    pts = pts[conf >= conf_threshold]
-    if n_points > 0 and len(pts) > n_points:
-        rng = np.random.default_rng(seed)
-        pts = pts[rng.choice(len(pts), n_points, replace=False)]
-    return pts.astype(np.float32)
+    """Load point cloud, generating point_map/point_confidence if missing."""
+    ensure_prediction_outputs(date_dir, cfg, ["point_map", "point_confidence"])
+    return load_pointmap_cloud(date_dir, conf_threshold, n_points, seed)
 
 
 def apply_baseline(
@@ -374,6 +412,47 @@ def pointmap_to_cloud(
     return pts_np
 
 
+def pointmap_view_to_cloud(
+    pm_view: torch.Tensor,
+    conf_view: torch.Tensor,
+    conf_threshold: float,
+    n_points: int,
+    seed: int,
+) -> np.ndarray:
+    """Flatten one [H, W, 3] point map view into a filtered point cloud."""
+    return pointmap_to_cloud(
+        pm_view.unsqueeze(0),
+        conf_view.unsqueeze(0),
+        conf_threshold,
+        n_points,
+        seed,
+    )
+
+
+def summarize_per_view_metrics(view_metrics: list[dict[str, float]]) -> dict[str, float]:
+    """Return per_view_mean/* and per_view_std/* metric summaries."""
+    if not view_metrics:
+        return {}
+    keys = view_metrics[0].keys()
+    summary: dict[str, float] = {}
+    for key in keys:
+        vals = np.array(
+            [
+                metrics[key]
+                for metrics in view_metrics
+                if isinstance(metrics.get(key), float) and not np.isnan(metrics[key])
+            ],
+            dtype=np.float64,
+        )
+        if len(vals) == 0:
+            summary[f"per_view_mean_{key}"] = float("nan")
+            summary[f"per_view_std_{key}"] = float("nan")
+        else:
+            summary[f"per_view_mean_{key}"] = float(vals.mean())
+            summary[f"per_view_std_{key}"] = float(vals.std())
+    return summary
+
+
 def pointmap_l1_l2(
     pred_pm: torch.Tensor,
     target_pm: torch.Tensor,
@@ -405,14 +484,28 @@ def load_model(cfg: dict[str, Any], checkpoint: Path, device: str) -> torch.nn.M
     # Snapshot a trainable parameter before loading so we can verify the
     # checkpoint actually changed it (guards against silent load failures).
     probe_name, probe_before = next(
-        ((n, p.detach().clone()) for n, p in model.named_parameters() if p.requires_grad),
+        (
+            (n, p.detach().clone())
+            for n, p in model.named_parameters()
+            if p.requires_grad and not (cfg.get("freeze_point_head", False) and n.startswith("point_head."))
+        ),
         (None, None),
     )
 
     state = torch.load(checkpoint, map_location=device, weights_only=True)
-    # strict=True (the default) raises if any key is missing or unexpected,
-    # catching architecture mismatches between the saved run and this config.
-    model.load_state_dict(state, strict=True)
+    if cfg.get("freeze_point_head", False):
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        bad_missing = [k for k in missing if not k.startswith("point_head.")]
+        if bad_missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint mismatch. missing={bad_missing} unexpected={unexpected}"
+            )
+        # Training removed point_head to save memory. For evaluation we keep the
+        # pretrained VGGT point head so predicted cached layers can be decoded.
+        model.freeze_point_head = False
+    else:
+        # strict=True catches architecture mismatches for normal checkpoints.
+        model.load_state_dict(state, strict=True)
     del state
 
     # Explicitly move to device after load_state_dict in case any sub-module
@@ -469,19 +562,49 @@ def evaluate_sample(
     variant_dir: Path = sample["variant_dir"]
     tau = compute_tau(sample["t1_date"], sample["t2_date"], sample["t3_date"])
 
-    # Load t1 / t3 point clouds for baselines (falls back to live VGGT if t2_only run).
-    vggt_model_id = cfg.get("vggt_model_id", "facebook/VGGT-1B")
-    vggt_device   = cfg.get("vggt_device", "auto")
-    img_mode      = cfg.get("image_preprocess_mode", "pad")
+    # Load t1 / t2 / t3 point clouds, generating missing VGGT predictions on demand.
     pts_t1 = load_or_infer_pointcloud(
-        variant_dir / "t1", conf_thr, n_points, seed, vggt_model_id, vggt_device, img_mode,
+        variant_dir / "t1", conf_thr, n_points, seed, cfg,
     )
     pts_t3 = load_or_infer_pointcloud(
-        variant_dir / "t3", conf_thr, n_points, seed, vggt_model_id, vggt_device, img_mode,
+        variant_dir / "t3", conf_thr, n_points, seed, cfg,
     )
 
     # Reference: teacher t2 point cloud.
-    pts_t2_ref = load_pointmap_cloud(variant_dir / "t2", conf_thr, n_points, seed)
+    pts_t2_ref = load_or_infer_pointcloud(
+        variant_dir / "t2", conf_thr, n_points, seed, cfg,
+    )
+    if sample.get("target_point_maps_t2") is None:
+        query_indices = sample.get("query_view_indices")
+        if query_indices is not None:
+            pt_maps, pt_conf, depths, d_conf, vggt_ext, vggt_intr = _load_geometry(
+                variant_dir / "t2", query_indices
+            )
+            sample["target_point_maps_t2"] = pt_maps
+            sample["target_point_confidence_t2"] = pt_conf
+            sample["target_masks_t2"] = (
+                (pt_conf > conf_thr).float() if pt_conf is not None else None
+            )
+            sample["target_depths_t2"] = depths
+            sample["target_depth_masks_t2"] = (
+                (d_conf > conf_thr).float() if d_conf is not None else None
+            )
+            sample["target_vggt_extrinsic_t2"] = vggt_ext
+            sample["target_vggt_intrinsic_t2"] = vggt_intr
+    target_view_clouds: list[np.ndarray] = []
+    if sample.get("target_point_maps_t2") is not None and sample.get("target_masks_t2") is not None:
+        target_pm_cpu = sample["target_point_maps_t2"]
+        target_mask_cpu = sample["target_masks_t2"]
+        for view_idx in range(target_pm_cpu.shape[0]):
+            target_view_clouds.append(
+                pointmap_view_to_cloud(
+                    target_pm_cpu[view_idx].float(),
+                    target_mask_cpu[view_idx].float(),
+                    0.5,
+                    n_points,
+                    seed + view_idx,
+                )
+            )
 
     # Confidence stats (before and after threshold) for precomputed sources.
     conf_stats: dict = {"conf_threshold": conf_thr}
@@ -509,10 +632,26 @@ def evaluate_sample(
         "is_adjacent": sample.get("is_adjacent", None),
     }
 
+    baseline_clouds: dict[str, np.ndarray] = {}
     for baseline in BASELINES:
         pred = apply_baseline(baseline, pts_t1, pts_t3, tau, n_points, seed)
+        baseline_clouds[baseline] = pred
         row[baseline] = compute_metrics(pred, pts_t2_ref, threshold=threshold,
                                         voxel_size=voxel_sz, alpha=alpha, beta=beta)
+        if target_view_clouds:
+            row[baseline].update(
+                summarize_per_view_metrics([
+                    compute_metrics(
+                        pred,
+                        target_view_cloud,
+                        threshold=threshold,
+                        voxel_size=voxel_sz,
+                        alpha=alpha,
+                        beta=beta,
+                    )
+                    for target_view_cloud in target_view_clouds
+                ])
+            )
 
     if model is not None:
         # Build a single-sample batch (same structure as DataLoader output).
@@ -551,6 +690,11 @@ def evaluate_sample(
             f"  passed={s['passed']}/{s['total']} ({s['fraction_passed']:.1%})")
 
         # Teacher maps for PointMap-L1/L2 — align resolution if needed.
+        if sample.get("target_point_maps_t2") is None or sample.get("target_masks_t2") is None:
+            raise RuntimeError(
+                "t2 point_map/point_confidence are required for model pointmap metrics; "
+                "evaluation could not generate or load them."
+            )
         target_pm   = sample["target_point_maps_t2"].to(device)    # [Q, H, W, 3]
         target_mask = sample["target_masks_t2"].to(device)         # [Q, H, W]
 
@@ -571,6 +715,33 @@ def evaluate_sample(
         pred_cloud = pointmap_to_cloud(pred_points.float(), pred_conf.float(), conf_thr, n_points, seed)
         metrics = compute_metrics(pred_cloud, pts_t2_ref, threshold=threshold,
                                   voxel_size=voxel_sz, alpha=alpha, beta=beta)
+        per_view_metrics = []
+        for view_idx in range(pred_points.shape[0]):
+            pred_view_cloud = pointmap_view_to_cloud(
+                pred_points[view_idx].float(),
+                pred_conf[view_idx].float(),
+                conf_thr,
+                n_points,
+                seed + view_idx,
+            )
+            target_view_cloud = pointmap_view_to_cloud(
+                target_pm[view_idx].float(),
+                target_mask[view_idx].float(),
+                0.5,
+                n_points,
+                seed + view_idx,
+            )
+            per_view_metrics.append(
+                compute_metrics(
+                    pred_view_cloud,
+                    target_view_cloud,
+                    threshold=threshold,
+                    voxel_size=voxel_sz,
+                    alpha=alpha,
+                    beta=beta,
+                )
+            )
+        metrics.update(summarize_per_view_metrics(per_view_metrics))
         metrics["pointmap_l1"] = l1
         metrics["pointmap_l2"] = l2
         metrics["n_pred_points"] = int(len(pred_cloud))
@@ -582,6 +753,7 @@ def evaluate_sample(
         row["model"] = metrics
 
         if cloud_output_dir is not None:
+            ensure_prediction_outputs(variant_dir / "t2", cfg, ["extrinsic", "intrinsic"])
             cloud_output_dir.mkdir(parents=True, exist_ok=True)
             key = f"{row['t1_date']}_{row['t2_date']}_{row['t3_date']}_{row['crop']}_{sample['variant']}"
 
@@ -605,6 +777,11 @@ def evaluate_sample(
 
             np.save(cloud_output_dir / f"{key}_pred.npy", _to_gps_pred(pred_cloud))
             np.save(cloud_output_dir / f"{key}_ref.npy", _to_gps_ref(pts_t2_ref))
+            for baseline, baseline_pts in baseline_clouds.items():
+                np.save(
+                    cloud_output_dir / f"{key}_{baseline}.npy",
+                    _to_gps_ref(baseline_pts),
+                )
 
     row["conf_stats"] = conf_stats
     return row
@@ -665,6 +842,11 @@ def evaluate_fold(
     max_samples = cfg.get("max_samples")
     if max_samples is not None:
         test_idx = test_idx[:max_samples]
+    total_test_idx = len(test_idx)
+
+    rank = _rank()
+    world_size = _world_size()
+    test_idx = test_idx[rank::world_size]
 
     nw = cfg.get("num_workers", 2)
     loader = DataLoader(
@@ -676,15 +858,15 @@ def evaluate_fold(
     )
 
     if model is not None:
-        log(f"  model loaded — will run inference on {len(test_idx)} samples")
+        log(f"  model loaded — will run inference on {total_test_idx} samples across {world_size} rank(s)")
     else:
-        log(f"  no model — evaluating baselines only on {len(test_idx)} samples")
+        log(f"  no model — evaluating baselines only on {total_test_idx} samples across {world_size} rank(s)")
 
     first_inference_done = False
     rows: list[dict] = []
     pbar = tqdm(
         zip(test_idx, loader), total=len(test_idx),
-        desc=fold["fold_id"], leave=False, dynamic_ncols=True,
+        desc=fold["fold_id"], leave=False, dynamic_ncols=True, disable=not _is_main(),
     )
     for i, sample in pbar:
         sample["variant_dir"] = dataset.index[i]["variant_dir"]
@@ -703,6 +885,12 @@ def evaluate_fold(
                 f" variant={dataset.index[i]['variant']}: {e}"
             )
 
+    if _is_distributed():
+        dist.barrier()
+        gathered_rows = [None] * world_size
+        dist.all_gather_object(gathered_rows, rows)
+        rows = [row for rank_rows in gathered_rows for row in rank_rows]
+
     aggregated = aggregate_results(rows, method_keys)
 
     # Aggregate per-source conf stats across all samples and save to conf_stats.json.
@@ -719,8 +907,9 @@ def evaluate_fold(
     conf_stats_summary = {"conf_threshold": conf_thr_val}
     for src, metrics in conf_stats_buckets.items():
         conf_stats_summary[src] = {k: float(np.mean(vs)) for k, vs in metrics.items()}
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "conf_stats.json", conf_stats_summary)
+    if _is_main():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(output_dir / "conf_stats.json", conf_stats_summary)
 
     result = {
         "fold_id": fold["fold_id"],
@@ -731,16 +920,19 @@ def evaluate_fold(
         "aggregated": aggregated,
         "sample_rows": rows,
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "eval_result.json", result)
+    if _is_main():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(output_dir / "eval_result.json", result)
 
-    # Print summary for each method.
-    for method in method_keys:
-        m = aggregated["overall"].get(method, {})
-        log(f"  {fold['fold_id']} [{method}]  "
-            f"chamfer={m.get('asymmetric_chamfer', float('nan')):.4f}  "
-            f"f1={m.get('f1', float('nan')):.4f}  "
-            f"pm_l1={m.get('pointmap_l1', float('nan')):.4f}")
+        # Print summary for each method.
+        for method in method_keys:
+            m = aggregated["overall"].get(method, {})
+            log(f"  {fold['fold_id']} [{method}]  "
+                f"chamfer={m.get('asymmetric_chamfer', float('nan')):.4f}  "
+                f"f1={m.get('f1', float('nan')):.4f}  "
+                f"pv_chamfer={m.get('per_view_mean_asymmetric_chamfer', float('nan')):.4f}  "
+                f"pv_f1={m.get('per_view_mean_f1', float('nan')):.4f}  "
+                f"pm_l1={m.get('pointmap_l1', float('nan')):.4f}")
 
     return result
 
@@ -772,11 +964,20 @@ def _log_device_info(device: str) -> None:
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    distributed = _is_distributed()
+    if distributed:
+        local_rank, world_size = _setup_distributed()
+    else:
+        local_rank, world_size = 0, 1
+
     args = parse_args()
     cfg  = build_config(args)
-    device = cfg["device"]
+    device = f"cuda:{local_rank}" if distributed else cfg["device"]
+    cfg["device"] = device
+    if cfg.get("vggt_device", "auto") == "auto" and str(device).startswith("cuda"):
+        cfg["vggt_device"] = device
 
-    log(f"device={device}  output={cfg['output_root']}")
+    log(f"world_size={world_size} device={device}  output={cfg['output_root']}")
     _log_device_info(device)
 
     cache_root = cfg.get("feature_cache_root")
@@ -810,10 +1011,13 @@ def main() -> None:
 
     has_model_cfg = cfg.get("model_module") and cfg.get("model_class")
 
-    cfg["output_root"].mkdir(parents=True, exist_ok=True)
-    write_json(cfg["output_root"] / "eval_config.json", {
-        k: str(v) if isinstance(v, Path) else v for k, v in cfg.items()
-    })
+    if _is_main():
+        cfg["output_root"].mkdir(parents=True, exist_ok=True)
+        write_json(cfg["output_root"] / "eval_config.json", {
+            k: str(v) if isinstance(v, Path) else v for k, v in cfg.items()
+        })
+    if _is_distributed():
+        dist.barrier()
 
     all_results: list[dict] = []
     for protocol in cfg["protocols"]:
@@ -850,11 +1054,15 @@ def main() -> None:
                 del model
                 torch.cuda.empty_cache()
 
-    write_json(cfg["output_root"] / "eval_summary.json", all_results)
-    log(f"Done. Summary: {cfg['output_root'] / 'eval_summary.json'}")
+    if _is_main():
+        write_json(cfg["output_root"] / "eval_summary.json", all_results)
+        log(f"Done. Summary: {cfg['output_root'] / 'eval_summary.json'}")
 
-    # Print cross-fold aggregate per method.
-    _print_summary(all_results)
+        # Print cross-fold aggregate per method.
+        _print_summary(all_results)
+
+    if distributed:
+        _cleanup_distributed()
 
 
 def _print_summary(all_results: list[dict]) -> None:
@@ -880,6 +1088,8 @@ def _print_summary(all_results: list[dict]) -> None:
             log(f"    {method:35s}  "
                 f"chamfer={m.get('asymmetric_chamfer', float('nan')):.4f}  "
                 f"f1={m.get('f1', float('nan')):.4f}  "
+                f"pv_chamfer={m.get('per_view_mean_asymmetric_chamfer', float('nan')):.4f}  "
+                f"pv_f1={m.get('per_view_mean_f1', float('nan')):.4f}  "
                 f"pm_l1={m.get('pointmap_l1', float('nan')):.4f}")
     log("=" * 72)
 
