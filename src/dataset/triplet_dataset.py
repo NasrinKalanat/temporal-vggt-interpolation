@@ -50,42 +50,39 @@ def _load_cameras(date_dir: Path) -> dict[str, Any]:
 def _load_geometry(
     date_dir: Path,
     query_indices: list[int],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load VGGT predictions for selected query view indices.
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Load available VGGT predictions for selected query view indices.
 
     Returns:
-        point_maps:        [Q, H, W, 3]  float32
-        point_confidence:  [Q, H, W]     float32
-        depths:            [Q, H, W]     float32
-        depth_confidence:  [Q, H, W]     float32
-        vggt_extrinsic:    [Q, 3, 4]     float32  world-to-camera (VGGT space)
-        vggt_intrinsic:    [Q, 3, 3]     float32
+        Optional tensors for point/depth/camera predictions. Missing files are
+        returned as None so cached-feature-only training can skip them.
     """
     pred_dir = date_dir / "predictions"
     query = np.array(query_indices)
 
-    pm  = np.load(pred_dir / "point_map.npy").astype(np.float32)         # [S, H, W, 3]
-    pc  = np.load(pred_dir / "point_confidence.npy").astype(np.float32)  # [S, H, W] or [S, H, W, 1]
-    dm  = np.load(pred_dir / "depth_map.npy").astype(np.float32)         # [S, H, W] or [S, H, W, 1]
-    dc  = np.load(pred_dir / "depth_confidence.npy").astype(np.float32)  # [S, H, W] or [S, H, W, 1]
-    ext = np.load(pred_dir / "extrinsic.npy").astype(np.float32)         # [S, 3, 4]
-    intr = np.load(pred_dir / "intrinsic.npy").astype(np.float32)        # [S, 3, 3]
-
-    # Squeeze trailing channel dim if present
-    if pc.ndim == 4 and pc.shape[-1] == 1:
-        pc = pc[..., 0]
-    if dm.ndim == 4 and dm.shape[-1] == 1:
-        dm = dm[..., 0]
-    if dc.ndim == 4 and dc.shape[-1] == 1:
-        dc = dc[..., 0]
+    def load_optional(name: str, squeeze_channel: bool = False) -> torch.Tensor | None:
+        path = pred_dir / name
+        if not path.exists():
+            return None
+        arr = np.load(path).astype(np.float32)
+        if squeeze_channel and arr.ndim == 4 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        return torch.from_numpy(arr[query])
 
     return (
-        torch.from_numpy(pm[query]),    # [Q, H, W, 3]
-        torch.from_numpy(pc[query]),    # [Q, H, W]
-        torch.from_numpy(dm[query]),    # [Q, H, W]
-        torch.from_numpy(dc[query]),    # [Q, H, W]
-        torch.from_numpy(ext[query]),   # [Q, 3, 4]
-        torch.from_numpy(intr[query]),  # [Q, 3, 3]
+        load_optional("point_map.npy"),
+        load_optional("point_confidence.npy", squeeze_channel=True),
+        load_optional("depth_map.npy", squeeze_channel=True),
+        load_optional("depth_confidence.npy", squeeze_channel=True),
+        load_optional("extrinsic.npy"),
+        load_optional("intrinsic.npy"),
     )
 
 
@@ -282,13 +279,11 @@ class TemporalTripletDataset(Dataset):
             for variant_dir in sorted(triplet_dir.iterdir()):
                 if not variant_dir.is_dir():
                     continue
-                # t2 must have predictions; t1/t3 need at least dataset_cameras.json
-                # (t2_only runs skip VGGT for t1/t3 but still write their metadata).
-                if not (variant_dir / "t2" / "predictions" / "point_map.npy").exists():
-                    continue
+                # t1/t2/t3 need camera metadata. Prediction .npy files are
+                # optional for cached-feature-only training.
                 if not all(
                     (variant_dir / dl / "dataset_cameras.json").exists()
-                    for dl in ("t1", "t3")
+                    for dl in ("t1", "t2", "t3")
                 ):
                     continue
                 index.append({
@@ -379,9 +374,9 @@ class TemporalTripletDataset(Dataset):
             # Supervision
             "target_point_maps_t2": pt_maps,                            # [Q, H, W, 3]
             "target_point_confidence_t2": pt_conf,                      # [Q, H, W]
-            "target_masks_t2": (pt_conf > self.conf_threshold).float(), # [Q, H, W]
+            "target_masks_t2": (pt_conf > self.conf_threshold).float() if pt_conf is not None else None,
             "target_depths_t2": depths,                                  # [Q, H, W]
-            "target_depth_masks_t2": (d_conf > self.conf_threshold).float(),  # [Q, H, W]
+            "target_depth_masks_t2": (d_conf > self.conf_threshold).float() if d_conf is not None else None,
             "target_vggt_extrinsic_t2": vggt_ext,                      # [Q, 3, 4]
             "target_vggt_intrinsic_t2": vggt_intr,                     # [Q, 3, 3]
             # Metadata
@@ -529,4 +524,3 @@ class LiveTripletDataset(Dataset):
             "variant": entry["variant"],
             "query_view_indices": query_indices,
         }
-

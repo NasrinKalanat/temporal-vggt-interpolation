@@ -357,9 +357,24 @@ def compute_loss(
     loss_dict: dict[str, torch.Tensor] = {}
     total_loss = torch.tensor(0.0, device=device)
 
+    def _missing_batch_value(key: str) -> bool:
+        value = batch.get(key)
+        return value is None or (
+            isinstance(value, (list, tuple)) and any(item is None for item in value)
+        )
+
     # --- Pointmap loss (skipped when point head is frozen / not in outputs) ---
     pointmap_weight = loss_cfg.get("pointmap_weight", 1.0)
     if pointmap_weight > 0 and "pred_points" in outputs:
+        if any(_missing_batch_value(k) for k in (
+            "target_point_maps_t2",
+            "target_point_confidence_t2",
+            "target_masks_t2",
+        )):
+            raise RuntimeError(
+                "Pointmap loss is enabled, but t2 point_map/point_confidence "
+                "predictions are missing. Generate them or set pointmap_weight: 0."
+            )
         pred_points = outputs["pred_points"]
         pred_conf   = outputs["pred_conf"]
 
@@ -436,6 +451,14 @@ def compute_loss(
         loss_dict["loss_delta_reg"] = delta_reg
 
     if "pred_pose_enc_list_t2q" in outputs and "pred_points" in outputs:
+        if any(_missing_batch_value(k) for k in (
+            "target_vggt_extrinsic_t2",
+            "target_vggt_intrinsic_t2",
+        )):
+            raise RuntimeError(
+                "Camera loss is enabled by model outputs, but t2 extrinsic/intrinsic "
+                "predictions are missing. Generate them or disable camera loss outputs."
+            )
         pred_points = outputs["pred_points"]
         cam_cfg = cfg.get("camera_loss", {})
         lambda_camera = cam_cfg.get("lambda_camera", 0.1)

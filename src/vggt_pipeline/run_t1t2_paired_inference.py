@@ -40,9 +40,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vggt_pipeline.execute_vggt import (
     get_vggt_runner,
+    normalize_prediction_outputs,
+    prediction_output_files,
     run_vggt_inference_from_image_paths,
-    save_cached_layers,
-    cached_layers_exist,
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -60,6 +60,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "image_preprocess_mode": "pad",
     "skip_existing": True,
     "t2_only": False,
+    # Which predictions/*.npy files to generate. Use "all", "none", or a list
+    # from: point_map, point_confidence, extrinsic, intrinsic, depth_map,
+    # depth_confidence, cached_layers. cached_layers are generated only for t2.
+    # In this script, "all" preserves the old behavior: standard prediction
+    # files plus t2 cached_layers.
+    # Legacy point_map_only=true maps to point_map + point_confidence when
+    # prediction_outputs is not explicitly set.
+    "prediction_outputs": "all",
     "point_map_only": False,
     "dry_run": False,
     "t2_cache_layers": [4, 11, 17, 23],  # aggregator layer indices to cache for t2
@@ -121,7 +129,8 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> dict[str, Any]:
     config: dict[str, Any] = dict(DEFAULT_CONFIG)
-    config.update(load_yaml_config(args.config))
+    file_config = load_yaml_config(args.config)
+    config.update(file_config)
 
     if args.paired_triplets_path is not None:
         config["paired_triplets_path"] = args.paired_triplets_path
@@ -154,6 +163,14 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     if args.dry_run is not None:
         config["dry_run"] = args.dry_run
 
+    raw_prediction_outputs = config.get("prediction_outputs")
+    if config.get("point_map_only") and "prediction_outputs" not in file_config:
+        config["prediction_outputs"] = ["point_map", "point_confidence"]
+    elif raw_prediction_outputs is None or raw_prediction_outputs == "all":
+        config["prediction_outputs"] = list(normalize_prediction_outputs("all")) + ["cached_layers"]
+    else:
+        config["prediction_outputs"] = list(normalize_prediction_outputs(raw_prediction_outputs))
+
     config["num_gpus"] = args.num_gpus
     config["gpu_rank"] = args.gpu_rank
     # Override device to use the GPU corresponding to this worker's rank
@@ -167,6 +184,20 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     if isinstance(config.get("crops"), str):
         config["crops"] = [config["crops"]]
     return config
+
+
+def outputs_for_date(date_label: str, prediction_outputs: Any) -> list[str]:
+    outputs = list(normalize_prediction_outputs(prediction_outputs))
+    if date_label != "t2":
+        outputs = [output for output in outputs if output != "cached_layers"]
+    return outputs
+
+
+def predictions_exist(date_dir: Path, prediction_outputs: Any, cache_layers: list[int] | None = None) -> bool:
+    files = prediction_output_files(prediction_outputs, cache_layers=cache_layers)
+    if not files:
+        return (date_dir / "dataset_cameras.json").exists()
+    return all((date_dir / "predictions" / filename).exists() for filename in files)
 
 
 def entry_id(entry: dict[str, Any]) -> str:
@@ -255,7 +286,8 @@ def run_date_inference(
     skip_vggt: bool = False,
 ) -> dict[str, Any]:
     date_dir = variant_dir / date_label
-    pred_dir = date_dir / "predictions"
+    date_outputs = outputs_for_date(date_label, config.get("prediction_outputs"))
+    cache_layers = config.get("t2_cache_layers", [4, 11, 17, 23])
 
     if skip_vggt:
         if config.get("skip_existing") and (date_dir / "dataset_cameras.json").exists():
@@ -272,18 +304,7 @@ def run_date_inference(
         log(f"{label} metadata only (t2_only) date={date_str}")
         return {"date": date_str, "date_label": date_label, "status": "skipped_t2_only"}
 
-    if config.get("skip_existing") and (pred_dir / "point_map.npy").exists() and (pred_dir / "extrinsic.npy").exists():
-        # Even if full inference is skipped, ensure cached layers exist for t2
-        cache_layers = config.get("t2_cache_layers", [4, 11, 17, 23])
-        if date_label == "t2" and not cached_layers_exist(date_dir, cache_layers):
-            image_paths, _, _ = resolve_date_views(date_views)
-            save_cached_layers(
-                image_paths=image_paths,
-                output_dir=date_dir,
-                runner=runner,
-                image_preprocess_mode=config["image_preprocess_mode"],
-                cache_layers=cache_layers,
-            )
+    if config.get("skip_existing") and predictions_exist(date_dir, date_outputs, cache_layers=cache_layers):
         log(f"{label} skip existing date={date_str}")
         return {"date": date_str, "status": "skipped"}
 
@@ -299,34 +320,35 @@ def run_date_inference(
         "n_input_views": len(image_paths),
         "model_id": config["model_id"],
         "image_preprocess_mode": config["image_preprocess_mode"],
+        "prediction_outputs": date_outputs,
     })
 
-    metadata = run_vggt_inference_from_image_paths(
-        image_paths=image_paths,
-        output_dir=date_dir,
-        runner=runner,
-        image_preprocess_mode=config["image_preprocess_mode"],
-        input_image_list_path=list_path,
-    )
-
-    # Save cached layers for t2 (reuses preprocessed images via save_cached_layers)
-    if date_label == "t2":
-        save_cached_layers(
+    if date_outputs:
+        if runner is None:
+            raise RuntimeError("VGGT outputs were requested, but the VGGT model was not loaded.")
+        metadata = run_vggt_inference_from_image_paths(
             image_paths=image_paths,
             output_dir=date_dir,
             runner=runner,
             image_preprocess_mode=config["image_preprocess_mode"],
-            cache_layers=config.get("t2_cache_layers", [4, 11, 17, 23]),
+            input_image_list_path=list_path,
+            prediction_outputs=date_outputs,
+            cache_layers=cache_layers,
         )
+        duration_sec = metadata.get("duration_sec")
+        status_name = "completed"
+    else:
+        duration_sec = 0.0
+        status_name = "metadata_only"
 
     status = {
         "date": date_str,
         "date_label": date_label,
-        "status": "completed",
-        "duration_sec": metadata.get("duration_sec"),
+        "status": status_name,
+        "duration_sec": duration_sec,
     }
     write_json(date_dir / "run_status.json", status)
-    log(f"{label} done date={date_str} duration={metadata.get('duration_sec'):.1f}s")
+    log(f"{label} done date={date_str} status={status_name} duration={duration_sec:.1f}s")
     return status
 
 
@@ -349,15 +371,21 @@ def run_variant(
 
     if config.get("skip_existing"):
         cache_layers = config.get("t2_cache_layers", [4, 11, 17, 23])
-        t2_cached = cached_layers_exist(variant_dir / "t2", cache_layers)
-        t2_done = (variant_dir / "t2" / "predictions" / "point_map.npy").exists()
+        t2_done = predictions_exist(
+            variant_dir / "t2",
+            outputs_for_date("t2", config.get("prediction_outputs")),
+            cache_layers=cache_layers,
+        )
         ctx_done = all((variant_dir / dl / "dataset_cameras.json").exists() for dl in ("t1", "t3"))
-        if t2_only and t2_done and t2_cached and ctx_done:
+        if t2_only and t2_done and ctx_done:
             log(f"{label} skip existing entry={eid} variant={variant_name}")
             return {"entry_id": eid, "variant": variant_name, "status": "skipped"}
-        if not t2_only and t2_cached and all(
-            (variant_dir / dl / "predictions" / "point_map.npy").exists()
-            and (variant_dir / dl / "predictions" / "extrinsic.npy").exists()
+        if not t2_only and all(
+            predictions_exist(
+                variant_dir / dl,
+                outputs_for_date(dl, config.get("prediction_outputs")),
+                cache_layers=cache_layers,
+            )
             for dl in ("t1", "t2", "t3")
         ):
             log(f"{label} skip existing entry={eid} variant={variant_name}")
@@ -377,7 +405,7 @@ def run_variant(
         )
         variant_results.append(status)
 
-    all_done = all(r["status"] in ("completed", "skipped", "skipped_t2_only") for r in variant_results)
+    all_done = all(r["status"] in ("completed", "skipped", "skipped_t2_only", "metadata_only") for r in variant_results)
     return {
         "entry_id": eid,
         "variant": variant_name,
@@ -447,9 +475,14 @@ def main() -> None:
         print(f"Total variants: {total_variants}")
         return
 
-    log(f"loading VGGT model_id={config['model_id']}")
-    runner = get_vggt_runner(model_id=config["model_id"], device=config["device"], use_cache=True)
-    log("model loaded")
+    needs_vggt = bool(config.get("prediction_outputs"))
+    if needs_vggt:
+        log(f"loading VGGT model_id={config['model_id']}")
+        runner = get_vggt_runner(model_id=config["model_id"], device=config["device"], use_cache=True)
+        log("model loaded")
+    else:
+        runner = None
+        log("prediction_outputs is empty; VGGT model will not be loaded")
 
     output_root.mkdir(parents=True, exist_ok=True)
     write_json(output_root / "run_config.json", {k: str(v) for k, v in config.items()})
@@ -515,4 +548,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

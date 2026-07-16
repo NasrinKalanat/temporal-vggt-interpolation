@@ -263,6 +263,22 @@ def compute_loss(
     pred_points = outputs["pred_points"]   # [B, Q, H, W, 3]
     pred_conf   = outputs["pred_conf"]     # [B, Q, H, W]
 
+    def _missing_batch_value(key: str) -> bool:
+        value = batch.get(key)
+        return value is None or (
+            isinstance(value, (list, tuple)) and any(item is None for item in value)
+        )
+
+    if any(_missing_batch_value(k) for k in (
+        "target_point_maps_t2",
+        "target_point_confidence_t2",
+        "target_masks_t2",
+    )):
+        raise RuntimeError(
+            "Pointmap training requires t2 point_map/point_confidence predictions. "
+            "Generate them or use the cached-feature training path."
+        )
+
     teacher_points = batch["target_point_maps_t2"].to(device)         # [B, Q, H, W, 3]
     teacher_conf   = batch["target_point_confidence_t2"].to(device)   # [B, Q, H, W]
     base_mask      = batch["target_masks_t2"].to(device).bool()       # [B, Q, H, W]
@@ -308,6 +324,14 @@ def compute_loss(
     total_loss = loss_dict["loss_pointmap"]
 
     if "pred_pose_enc_list_t2q" in outputs:
+        if any(_missing_batch_value(k) for k in (
+            "target_vggt_extrinsic_t2",
+            "target_vggt_intrinsic_t2",
+        )):
+            raise RuntimeError(
+                "Camera loss requires t2 extrinsic/intrinsic predictions. Generate them "
+                "or disable camera loss outputs."
+            )
         cam_cfg = cfg.get("camera_loss", {})
         lambda_camera = cam_cfg.get("lambda_camera", 0.1)
         image_size_hw = (pred_points.shape[-3], pred_points.shape[-2])

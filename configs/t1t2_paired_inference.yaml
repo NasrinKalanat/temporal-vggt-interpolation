@@ -32,9 +32,16 @@ skip_existing: true
 # Only run VGGT inference for t2; write metadata for t1/t3 without predictions.
 t2_only: false
 
-# Only keep point_map.npy and point_confidence.npy in predictions/; delete all other outputs.
+# Which predictions/*.npy files to generate.
+# Use "all" (standard predictions + t2 cached layers), "none", or a list from:
+#   point_map, point_confidence, extrinsic, intrinsic,
+#   depth_map, depth_confidence, cached_layers
+# If set to "none", VGGT is not loaded and only metadata files are written.
+prediction_outputs: none
+
+# Legacy shortcut: if true and prediction_outputs is not set, generates only
+# point_map.npy and point_confidence.npy.
 point_map_only: false
 
 # Aggregator layer indices to cache for t2 (used as supervision targets).
 t2_cache_layers: [4, 11, 17, 23]
-

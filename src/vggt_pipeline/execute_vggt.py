@@ -67,6 +67,56 @@ def get_vggt_runner(model_id: str, device: str = "auto", use_cache: bool = True)
 
 
 _DEFAULT_CACHE_LAYERS = [4, 11, 17, 23]
+DEFAULT_PREDICTION_OUTPUTS = (
+    "point_map",
+    "point_confidence",
+    "extrinsic",
+    "intrinsic",
+    "depth_map",
+    "depth_confidence",
+)
+VALID_PREDICTION_OUTPUTS = DEFAULT_PREDICTION_OUTPUTS + ("cached_layers",)
+
+
+def normalize_prediction_outputs(outputs: Any = None) -> tuple[str, ...]:
+    """Normalize configured prediction outputs to canonical output keys."""
+    if outputs is None or outputs == "all":
+        return DEFAULT_PREDICTION_OUTPUTS
+    if outputs in ("none", False):
+        return ()
+    if isinstance(outputs, str):
+        outputs = [outputs]
+
+    normalized: list[str] = []
+    valid = set(VALID_PREDICTION_OUTPUTS)
+    for output in outputs:
+        key = str(output).removesuffix(".npy")
+        if key == "all":
+            return DEFAULT_PREDICTION_OUTPUTS
+        if key == "none":
+            continue
+        if key not in valid:
+            raise ValueError(
+                f"Unknown prediction output {output!r}. "
+                f"Valid values are: {sorted(valid)} plus 'all' or 'none'."
+            )
+        if key not in normalized:
+            normalized.append(key)
+    return tuple(normalized)
+
+
+def prediction_output_files(
+    outputs: Any = None,
+    cache_layers: list[int] | None = None,
+) -> list[str]:
+    files: list[str] = []
+    for name in normalize_prediction_outputs(outputs):
+        if name == "cached_layers":
+            layers = cache_layers or _DEFAULT_CACHE_LAYERS
+            files.extend(f"cached_layer_{layer:02d}.npy" for layer in layers)
+        else:
+            files.append(f"{name}.npy")
+    return files
 
 
 def cached_layers_exist(output_dir: Path, cache_layers: list[int] | None = None) -> bool:
@@ -172,9 +222,12 @@ def run_vggt_inference_from_image_paths(
     runner: VggtRunner,
     image_preprocess_mode: str = "pad",
     input_image_list_path: Path | None = None,
+    prediction_outputs: Any = None,
+    cache_layers: list[int] | None = None,
 ) -> dict[str, Any]:
     log(f"start inference output_dir={output_dir} num_images={len(image_paths)}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    requested_outputs = normalize_prediction_outputs(prediction_outputs)
 
     images = load_and_preprocess_images(image_paths, mode=image_preprocess_mode)
     images = images.to(runner.device)
@@ -191,10 +244,23 @@ def run_vggt_inference_from_image_paths(
         with autocast_ctx:
             images_batch = images[None]
             aggregated_tokens_list, ps_idx = runner.model.aggregator(images_batch)
-            pose_enc = runner.model.camera_head(aggregated_tokens_list)[-1]
-            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-            depth_map, depth_conf = runner.model.depth_head(aggregated_tokens_list, images_batch, ps_idx)
-            point_map, point_conf = runner.model.point_head(aggregated_tokens_list, images_batch, ps_idx)
+            tensors: dict[str, torch.Tensor] = {}
+
+            if "extrinsic" in requested_outputs or "intrinsic" in requested_outputs:
+                pose_enc = runner.model.camera_head(aggregated_tokens_list)[-1]
+                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+                tensors["extrinsic"] = extrinsic
+                tensors["intrinsic"] = intrinsic
+
+            if "depth_map" in requested_outputs or "depth_confidence" in requested_outputs:
+                depth_map, depth_conf = runner.model.depth_head(aggregated_tokens_list, images_batch, ps_idx)
+                tensors["depth_map"] = depth_map
+                tensors["depth_confidence"] = depth_conf
+
+            if "point_map" in requested_outputs or "point_confidence" in requested_outputs:
+                point_map, point_conf = runner.model.point_head(aggregated_tokens_list, images_batch, ps_idx)
+                tensors["point_map"] = point_map
+                tensors["point_confidence"] = point_conf
 
     duration_sec = time.time() - start
     log(f"forward pass complete duration_sec={duration_sec:.3f}")
@@ -207,28 +273,26 @@ def run_vggt_inference_from_image_paths(
         np.save(path, arr)
         return str(path.resolve())
 
-    point_np = point_map.squeeze(0).detach().cpu().numpy()
-    point_conf_np = point_conf.squeeze(0).detach().cpu().numpy()
+    outputs = {}
+    for name in requested_outputs:
+        if name == "cached_layers":
+            layers = cache_layers or _DEFAULT_CACHE_LAYERS
+            layer_outputs = {}
+            for layer in layers:
+                arr = aggregated_tokens_list[layer].squeeze(0).float().cpu().numpy()
+                layer_outputs[str(layer)] = save(f"cached_layer_{layer:02d}.npy", arr)
+            outputs[name] = layer_outputs
+            continue
+        arr = tensors[name].squeeze(0).detach().cpu().numpy()
+        outputs[name] = save(f"{name}.npy", arr)
 
-    extrinsic_np = extrinsic.squeeze(0).detach().cpu().numpy()
-    intrinsic_np = intrinsic.squeeze(0).detach().cpu().numpy()
-    depth_np = depth_map.squeeze(0).detach().cpu().numpy()
-    depth_conf_np = depth_conf.squeeze(0).detach().cpu().numpy()
-
-    outputs = {
-        "point_map": save("point_map.npy", point_np),
-        "point_confidence": save("point_confidence.npy", point_conf_np),
-        "extrinsic": save("extrinsic.npy", extrinsic_np),
-        "intrinsic": save("intrinsic.npy", intrinsic_np),
-        "depth_map": save("depth_map.npy", depth_np),
-        "depth_confidence": save("depth_confidence.npy", depth_conf_np),
-    }
     metadata: dict[str, Any] = {
         "model_source": runner.model_source,
         "device": runner.device,
         "dtype": str(runner.dtype).replace("torch.", ""),
         "num_images": len(image_paths),
         "image_preprocess_mode": image_preprocess_mode,
+        "prediction_outputs": list(requested_outputs),
         "input_image_list": str(input_image_list_path.resolve()) if input_image_list_path else None,
         "output_dir": str(output_dir.resolve()),
         "duration_sec": duration_sec,
@@ -238,4 +302,3 @@ def run_vggt_inference_from_image_paths(
     meta_path.write_text(json.dumps(metadata, indent=2))
     log(f"saved predictions to {pred_dir}, metadata to {meta_path}")
     return metadata
-
