@@ -716,6 +716,8 @@ def evaluate_sample(
         metrics = compute_metrics(pred_cloud, pts_t2_ref, threshold=threshold,
                                   voxel_size=voxel_sz, alpha=alpha, beta=beta)
         per_view_metrics = []
+        pred_view_clouds: list[np.ndarray] = []
+        ref_view_clouds: list[np.ndarray] = []
         for view_idx in range(pred_points.shape[0]):
             pred_view_cloud = pointmap_view_to_cloud(
                 pred_points[view_idx].float(),
@@ -731,6 +733,8 @@ def evaluate_sample(
                 n_points,
                 seed + view_idx,
             )
+            pred_view_clouds.append(pred_view_cloud)
+            ref_view_clouds.append(target_view_cloud)
             per_view_metrics.append(
                 compute_metrics(
                     pred_view_cloud,
@@ -777,6 +781,21 @@ def evaluate_sample(
 
             np.save(cloud_output_dir / f"{key}_pred.npy", _to_gps_pred(pred_cloud))
             np.save(cloud_output_dir / f"{key}_ref.npy", _to_gps_ref(pts_t2_ref))
+            if pred_view_clouds and ref_view_clouds:
+                np.savez_compressed(
+                    cloud_output_dir / f"{key}_pred_views.npz",
+                    **{
+                        f"view_{view_idx:02d}": _to_gps_pred(view_cloud)
+                        for view_idx, view_cloud in enumerate(pred_view_clouds)
+                    },
+                )
+                np.savez_compressed(
+                    cloud_output_dir / f"{key}_ref_views.npz",
+                    **{
+                        f"view_{view_idx:02d}": _to_gps_ref(view_cloud)
+                        for view_idx, view_cloud in enumerate(ref_view_clouds)
+                    },
+                )
             for baseline, baseline_pts in baseline_clouds.items():
                 np.save(
                     cloud_output_dir / f"{key}_{baseline}.npy",

@@ -242,13 +242,14 @@ def extract_depth_cloud(
     max_points: int,
     seed: int,
     preprocess_mode: str = "pad",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Unproject VGGT depth maps into dataset (NeRFStudio) world space via Umeyama.
 
-    Returns (points_dataset, points_raw_vggt, conf) where:
+    Returns (points_dataset, points_raw_vggt, conf, view_index) where:
       - points_dataset: (N, 3) in NeRFStudio GPS world space
       - points_raw_vggt: (N, 3) in VGGT world space
       - conf: (N,) normalized confidence
+      - view_index: (N,) source view index for each retained point
     """
     pred_dir = date_dir / "predictions"
     depth_map = np.load(pred_dir / "depth_map.npy")
@@ -300,6 +301,7 @@ def extract_depth_cloud(
     all_pts_ds: list[np.ndarray] = []
     all_pts_vggt: list[np.ndarray] = []
     all_conf: list[np.ndarray] = []
+    all_view_idx: list[np.ndarray] = []
 
     for i in range(n_frames):
         d = depth_map[i, ::stride, ::stride].astype(np.float64)
@@ -327,43 +329,45 @@ def extract_depth_cloud(
         all_pts_ds.append(pts_ds[valid])
         all_pts_vggt.append(pts_vggt[valid])
         all_conf.append(conf_flat[valid])
+        all_view_idx.append(np.full(int(valid.sum()), i, dtype=np.int16))
 
     if not all_pts_ds:
         empty = np.zeros((0, 3), dtype=np.float32)
-        return empty, empty, np.zeros((0,), dtype=np.float32)
+        return empty, empty, np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int16)
 
     return (
         np.concatenate(all_pts_ds, axis=0),
         np.concatenate(all_pts_vggt, axis=0),
         np.concatenate(all_conf, axis=0),
+        np.concatenate(all_view_idx, axis=0),
     )
 
 
 def _filter_consistent(
-    pts_ds: np.ndarray, pts_vggt: np.ndarray, conf: np.ndarray,
+    pts_ds: np.ndarray, pts_vggt: np.ndarray, conf: np.ndarray, view_idx: np.ndarray,
     outlier_quantile: float, voxel_size: float, max_points: int, seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Filter outliers, voxel-downsample, and subsample; keep pts_vggt consistent."""
     if len(pts_ds) == 0:
-        return pts_ds, pts_vggt, conf
+        return pts_ds, pts_vggt, conf, view_idx
 
     centroid = pts_ds.mean(axis=0)
     dists = np.linalg.norm(pts_ds - centroid, axis=1)
     threshold = np.quantile(dists, 1.0 - outlier_quantile)
     keep = dists <= threshold
-    pts_ds, pts_vggt, conf = pts_ds[keep], pts_vggt[keep], conf[keep]
+    pts_ds, pts_vggt, conf, view_idx = pts_ds[keep], pts_vggt[keep], conf[keep], view_idx[keep]
 
     if voxel_size > 0 and len(pts_ds) > 0:
         voxel_idx = np.floor(pts_ds / voxel_size).astype(np.int64)
         _, uidx = np.unique(voxel_idx, axis=0, return_index=True)
-        pts_ds, pts_vggt, conf = pts_ds[uidx], pts_vggt[uidx], conf[uidx]
+        pts_ds, pts_vggt, conf, view_idx = pts_ds[uidx], pts_vggt[uidx], conf[uidx], view_idx[uidx]
 
     if max_points > 0 and len(pts_ds) > max_points:
         rng = np.random.default_rng(seed)
         idx = rng.choice(len(pts_ds), size=max_points, replace=False)
-        pts_ds, pts_vggt, conf = pts_ds[idx], pts_vggt[idx], conf[idx]
+        pts_ds, pts_vggt, conf, view_idx = pts_ds[idx], pts_vggt[idx], conf[idx], view_idx[idx]
 
-    return pts_ds, pts_vggt, conf
+    return pts_ds, pts_vggt, conf, view_idx
 
 
 def discover_triplet_date_variants(vggt_root: Path) -> list[tuple[str, str, str]]:
@@ -413,12 +417,12 @@ def build_geometry_for_date(
     dataset_cams = load_dataset_cameras(date_dir)
 
     if dataset_cams is not None:
-        pts_ds, pts_vggt, conf = extract_depth_cloud(
+        pts_ds, pts_vggt, conf, view_idx = extract_depth_cloud(
             date_dir, dataset_cams, conf_threshold, stride,
             0.0, 0.0, 0, seed, preprocess_mode,
         )
-        pts_ds, pts_vggt, conf = _filter_consistent(
-            pts_ds, pts_vggt, conf, outlier_quantile, voxel_size, max_points, seed,
+        pts_ds, pts_vggt, conf, view_idx = _filter_consistent(
+            pts_ds, pts_vggt, conf, view_idx, outlier_quantile, voxel_size, max_points, seed,
         )
         geometry_source = "depth_dataset_cameras"
     else:
@@ -427,14 +431,19 @@ def build_geometry_for_date(
         pm = np.load(pred_dir / "point_map.npy")
         pc = np.load(pred_dir / "point_confidence.npy")
         s = max(1, stride)
-        pts_ds = pm[:, ::s, ::s, :].reshape(-1, 3).astype(np.float32)
+        pm_strided = pm[:, ::s, ::s, :]
+        pts_ds = pm_strided.reshape(-1, 3).astype(np.float32)
         conf = pc[:, ::s, ::s].reshape(-1).astype(np.float32)
+        view_idx = np.repeat(
+            np.arange(pm_strided.shape[0], dtype=np.int16),
+            pm_strided.shape[1] * pm_strided.shape[2],
+        )
         conf = normalize_confidence(conf)
         valid = np.isfinite(pts_ds).all(1) & np.isfinite(conf) & (conf >= conf_threshold)
-        pts_ds, conf = pts_ds[valid], conf[valid]
+        pts_ds, conf, view_idx = pts_ds[valid], conf[valid], view_idx[valid]
         pts_vggt = pts_ds.copy()
-        pts_ds, pts_vggt, conf = _filter_consistent(
-            pts_ds, pts_vggt, conf, outlier_quantile, voxel_size, max_points, seed,
+        pts_ds, pts_vggt, conf, view_idx = _filter_consistent(
+            pts_ds, pts_vggt, conf, view_idx, outlier_quantile, voxel_size, max_points, seed,
         )
         geometry_source = "point_map_vggt"
 
@@ -461,12 +470,14 @@ def build_geometry_for_date(
         pts_aligned = pts_ds[roi_mask]
         pts_raw = pts_vggt[roi_mask]
         conf_out = conf[roi_mask]
+        view_idx_out = view_idx[roi_mask]
     else:
         norm_type = "none"
         pts_normalized = pts_ds
         pts_aligned = pts_ds
         pts_raw = pts_vggt
         conf_out = conf
+        view_idx_out = view_idx
 
     log(f"{triplet_id}/{variant}/{date_label}: final n={len(pts_normalized)} norm={norm_type}")
 
@@ -477,6 +488,7 @@ def build_geometry_for_date(
         points_aligned=pts_aligned,
         points_normalized=pts_normalized,
         confidence=conf_out,
+        view_index=view_idx_out.astype(np.int16),
     )
 
     norm_meta: dict[str, Any] = {"type": norm_type}
@@ -552,7 +564,7 @@ def main() -> None:
 
             dataset_cams = load_dataset_cameras(ref_date_dir)
             if dataset_cams is not None:
-                ref_pts, _, _ = extract_depth_cloud(
+                ref_pts, _, _, _ = extract_depth_cloud(
                     ref_date_dir, dataset_cams,
                     args.conf_threshold, args.stride,
                     args.outlier_quantile, args.voxel_size, args.max_points, args.seed, preprocess_mode,
@@ -627,4 +639,3 @@ def main() -> None:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     main()
-

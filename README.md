@@ -342,7 +342,7 @@ conda run -n 4d python src/eval_model.py --config configs/train_model_v1.yaml \
     --runs-root runs/model_v1 --output-root eval/model_v1 --save-clouds
 ```
 
-Clouds are written to `<output-root>/<protocol>/<fold_id>/clouds/` as `{t1}_{t2}_{t3}_{crop}_{variant}_pred.npy` and `..._ref.npy`.
+Clouds are written to `<output-root>/<protocol>/<fold_id>/clouds/` as merged `{t1}_{t2}_{t3}_{crop}_{variant}_pred.npy` / `..._ref.npy`, plus per-view `..._pred_views.npz` / `..._ref_views.npz` when `--save-clouds` is used.
 
 Per-fold results go to `<output-root>/<protocol>/<fold_id>/eval_result.json`.
 Cross-fold summary is written to `<output-root>/eval_summary.json` and printed at the end.
@@ -447,4 +447,3 @@ torchrun --nproc_per_node=4 src/eval_model.py \
   --crop corn \
   --test-date 20230831 \
   --save-clouds
-

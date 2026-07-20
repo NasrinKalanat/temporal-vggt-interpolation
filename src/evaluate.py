@@ -180,28 +180,70 @@ def load_cloud(
     seed: int,
     conf_threshold: float = 0.02,
 ) -> np.ndarray | None:
-    """Load from geometry_assets/{triplet_id}/{variant}/{date_label}/point_cloud_clean.npz."""
-    path = geometry_root / triplet_id / variant / date_label / "point_cloud_clean.npz"
-    if not path.exists():
-        return None
-    data = np.load(path)
+    """Load merged cloud from geometry_assets/{triplet_id}/{variant}/{date_label}/point_cloud_clean.npz."""
+    bundle = load_cloud_bundle(
+        geometry_root, triplet_id, variant, date_label,
+        n_points, seed, conf_threshold,
+    )
+    return None if bundle is None else bundle["merged"]
+
+
+def _choose_points(data: np.lib.npyio.NpzFile) -> np.ndarray | None:
     if "points_normalized" in data:
-        points = data["points_normalized"].astype(np.float32)
-    elif "points_aligned" in data:
-        points = data["points_aligned"].astype(np.float32)
-    elif "points" in data:
-        points = data["points"].astype(np.float32)
-    else:
-        return None
-    if "confidence" in data:
-        conf = data["confidence"].astype(np.float32)
-        points = points[conf >= conf_threshold]
-    if len(points) == 0:
-        return None
+        return data["points_normalized"].astype(np.float32)
+    if "points_aligned" in data:
+        return data["points_aligned"].astype(np.float32)
+    if "points" in data:
+        return data["points"].astype(np.float32)
+    return None
+
+
+def _subsample_points(points: np.ndarray, n_points: int, seed: int) -> np.ndarray:
     if n_points > 0 and len(points) > n_points:
         rng = np.random.default_rng(seed)
         points = points[rng.choice(len(points), n_points, replace=False)]
     return points
+
+
+def load_cloud_bundle(
+    geometry_root: Path,
+    triplet_id: str,
+    variant: str,
+    date_label: str,
+    n_points: int,
+    seed: int,
+    conf_threshold: float = 0.02,
+) -> dict[str, Any] | None:
+    """Load merged cloud plus per-view clouds when point_cloud_clean.npz has view_index."""
+    path = geometry_root / triplet_id / variant / date_label / "point_cloud_clean.npz"
+    if not path.exists():
+        return None
+    data = np.load(path)
+    points = _choose_points(data)
+    if points is None:
+        return None
+    view_index = data["view_index"].astype(np.int16) if "view_index" in data else None
+    if "confidence" in data:
+        conf = data["confidence"].astype(np.float32)
+        keep = conf >= conf_threshold
+        points = points[keep]
+        if view_index is not None:
+            view_index = view_index[keep]
+    if len(points) == 0:
+        return None
+
+    views: list[np.ndarray] = []
+    if view_index is not None and len(view_index) == len(points):
+        for view_id in sorted(np.unique(view_index).tolist()):
+            view_points = points[view_index == view_id]
+            if len(view_points) > 0:
+                views.append(_subsample_points(view_points, n_points, seed + int(view_id)))
+
+    return {
+        "merged": _subsample_points(points, n_points, seed),
+        "views": views,
+        "path": path,
+    }
 
 
 def list_variants(geometry_root: Path, triplet_id: str) -> list[str]:
@@ -255,6 +297,53 @@ def _avg_metrics(metric_list: list[dict]) -> dict:
     return out
 
 
+def summarize_per_view_metrics(view_metrics: list[dict[str, float]]) -> dict[str, float]:
+    """Summarize per-view metrics separately from merged-cloud metrics."""
+    if not view_metrics:
+        return {}
+    avg = _avg_metrics(view_metrics)
+    out = {f"per_view_mean_{key}": val for key, val in avg.items()}
+    for key in view_metrics[0].keys():
+        vals = np.array(
+            [
+                metrics[key]
+                for metrics in view_metrics
+                if isinstance(metrics.get(key), float) and not np.isnan(metrics[key])
+            ],
+            dtype=np.float64,
+        )
+        out[f"per_view_std_{key}"] = float(vals.std()) if len(vals) else float("nan")
+    return out
+
+
+def compute_per_view_baseline_metrics(
+    baseline: str,
+    t1_views: list[np.ndarray],
+    t2_views: list[np.ndarray],
+    t3_views: list[np.ndarray],
+    tau: float,
+    n_points: int,
+    seed: int,
+    threshold: float,
+    voxel_size: float,
+    alpha: float,
+    beta: float,
+) -> dict[str, float]:
+    view_metrics = []
+    for view_idx in range(min(len(t1_views), len(t2_views), len(t3_views))):
+        pred = apply_baseline(
+            baseline, t1_views[view_idx], t3_views[view_idx],
+            tau, n_points, seed + view_idx,
+        )
+        view_metrics.append(
+            compute_metrics(
+                pred, t2_views[view_idx], threshold=threshold,
+                voxel_size=voxel_size, alpha=alpha, beta=beta,
+            )
+        )
+    return summarize_per_view_metrics(view_metrics)
+
+
 def evaluate_triplet(
     triplet: dict[str, Any],
     geometry_root: Path,
@@ -292,24 +381,55 @@ def evaluate_triplet(
     variant_metrics: dict[str, list[dict]] = {k: [] for k in method_keys}
 
     for variant in variants:
-        pts_t1 = load_cloud(geometry_root, triplet_id, variant, "t1", n_points, seed, conf_threshold)
-        pts_t2 = load_cloud(geometry_root, triplet_id, variant, "t2", n_points, seed, conf_threshold)
-        pts_t3 = load_cloud(geometry_root, triplet_id, variant, "t3", n_points, seed + 1, conf_threshold)
+        t1_bundle = load_cloud_bundle(geometry_root, triplet_id, variant, "t1", n_points, seed, conf_threshold)
+        t2_bundle = load_cloud_bundle(geometry_root, triplet_id, variant, "t2", n_points, seed, conf_threshold)
+        t3_bundle = load_cloud_bundle(geometry_root, triplet_id, variant, "t3", n_points, seed + 1, conf_threshold)
 
-        if pts_t1 is None or pts_t2 is None or pts_t3 is None:
+        if t1_bundle is None or t2_bundle is None or t3_bundle is None:
             continue
+        pts_t1 = t1_bundle["merged"]
+        pts_t2 = t2_bundle["merged"]
+        pts_t3 = t3_bundle["merged"]
 
         for baseline in baselines:
             pred = apply_baseline(baseline, pts_t1, pts_t3, tau, n_points, seed)
             m = compute_metrics(pred, pts_t2, threshold=threshold, voxel_size=voxel_size,
                                 alpha=alpha, beta=beta)
+            m.update(
+                compute_per_view_baseline_metrics(
+                    baseline=baseline,
+                    t1_views=t1_bundle["views"],
+                    t2_views=t2_bundle["views"],
+                    t3_views=t3_bundle["views"],
+                    tau=tau,
+                    n_points=n_points,
+                    seed=seed,
+                    threshold=threshold,
+                    voxel_size=voxel_size,
+                    alpha=alpha,
+                    beta=beta,
+                )
+            )
             variant_metrics[baseline].append(m)
 
         if predicted_root is not None:
-            pts_pred = load_cloud(predicted_root, triplet_id, variant, "t2", n_points, seed, conf_threshold)
-            if pts_pred is not None:
-                m = compute_metrics(pts_pred, pts_t2, threshold=threshold, voxel_size=voxel_size,
+            pred_bundle = load_cloud_bundle(predicted_root, triplet_id, variant, "t2", n_points, seed, conf_threshold)
+            if pred_bundle is not None:
+                m = compute_metrics(pred_bundle["merged"], pts_t2, threshold=threshold, voxel_size=voxel_size,
                                     alpha=alpha, beta=beta)
+                view_metrics = []
+                for view_idx in range(min(len(pred_bundle["views"]), len(t2_bundle["views"]))):
+                    view_metrics.append(
+                        compute_metrics(
+                            pred_bundle["views"][view_idx],
+                            t2_bundle["views"][view_idx],
+                            threshold=threshold,
+                            voxel_size=voxel_size,
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                    )
+                m.update(summarize_per_view_metrics(view_metrics))
                 variant_metrics["predicted"].append(m)
 
         if model is not None:
@@ -322,6 +442,24 @@ def evaluate_triplet(
                 pred_np = pred_tensor.cpu().numpy().astype(np.float32)
             m = compute_metrics(pred_np, pts_t2, threshold=threshold, voxel_size=voxel_size,
                                 alpha=alpha, beta=beta)
+            view_metrics = []
+            for view_idx in range(min(len(t1_bundle["views"]), len(t2_bundle["views"]), len(t3_bundle["views"]))):
+                with torch.no_grad():
+                    t1_view = torch.from_numpy(t1_bundle["views"][view_idx]).to(device)
+                    t3_view = torch.from_numpy(t3_bundle["views"][view_idx]).to(device)
+                    tau_tensor = torch.tensor(tau, dtype=torch.float32).to(device)
+                    pred_view = model(t1_view, t3_view, tau_tensor).cpu().numpy().astype(np.float32)
+                view_metrics.append(
+                    compute_metrics(
+                        pred_view,
+                        t2_bundle["views"][view_idx],
+                        threshold=threshold,
+                        voxel_size=voxel_size,
+                        alpha=alpha,
+                        beta=beta,
+                    )
+                )
+            m.update(summarize_per_view_metrics(view_metrics))
             variant_metrics["model"].append(m)
 
     # Average metrics across variants for this triplet
@@ -519,4 +657,3 @@ def main() -> None:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()
-

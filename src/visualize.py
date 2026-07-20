@@ -65,6 +65,45 @@ def _parse_sample_label(key: str) -> str:
     return key
 
 
+def eval_view_options(clouds_dir: Path, sample_key: str) -> list[dict[str, str]]:
+    """Return merged plus saved per-view cloud choices for an eval sample."""
+    options = [{"label": "Merged views", "value": "merged"}]
+    pred_path = clouds_dir / f"{sample_key}_pred_views.npz"
+    ref_path = clouds_dir / f"{sample_key}_ref_views.npz"
+    if not pred_path.exists() or not ref_path.exists():
+        return options
+    try:
+        with np.load(pred_path) as pred_data, np.load(ref_path) as ref_data:
+            view_keys = sorted(set(pred_data.files) & set(ref_data.files))
+    except Exception:
+        return options
+    options.extend(
+        {
+            "label": key.replace("view_", "View "),
+            "value": key,
+        }
+        for key in view_keys
+    )
+    return options
+
+
+def load_eval_cloud_pair(
+    clouds_dir: Path,
+    sample_key: str,
+    view_key: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load merged eval clouds or one saved per-view pair."""
+    if view_key and view_key != "merged":
+        with np.load(clouds_dir / f"{sample_key}_pred_views.npz") as pred_data:
+            pred_pts = pred_data[view_key].astype(np.float32)
+        with np.load(clouds_dir / f"{sample_key}_ref_views.npz") as ref_data:
+            ref_pts = ref_data[view_key].astype(np.float32)
+        return pred_pts, ref_pts
+    pred_pts = np.load(clouds_dir / f"{sample_key}_pred.npy").astype(np.float32)
+    ref_pts = np.load(clouds_dir / f"{sample_key}_ref.npy").astype(np.float32)
+    return pred_pts, ref_pts
+
+
 # ─── data loading ────────────────────────────────────────────────────────────
 
 def discover_scenes(geometry_root: Path) -> list[str]:
@@ -372,6 +411,15 @@ def build_app(geometry_root: Path, vggt_root: Path, eval_root: Path | None = Non
                                     style={"width": "620px", "display": "inline-block",
                                            "marginRight": "8px"},
                                 ),
+                                html.Span("View:", style=_LB),
+                                dcc.Dropdown(
+                                    id="eval-view",
+                                    options=[{"label": "Merged views", "value": "merged"}],
+                                    value="merged",
+                                    clearable=False,
+                                    style={"width": "150px", "display": "inline-block",
+                                           "marginRight": "8px"},
+                                ),
                                 *_zscale_dd("eval-zscale"),
                             ], style={"marginBottom": "8px"}),
                             html.Div([
@@ -532,25 +580,37 @@ def build_app(geometry_root: Path, vggt_root: Path, eval_root: Path | None = Non
         return opts, (samples[0] if samples else None)
 
     @app.callback(
+        [Output("eval-view", "options"), Output("eval-view", "value")],
+        [Input("eval-fold", "value"), Input("eval-sample", "value")],
+    )
+    def update_eval_views(fold_id: str | None, sample_key: str | None) -> tuple:
+        if not fold_id or not sample_key or fold_id not in eval_clouds:
+            return [{"label": "Merged views", "value": "merged"}], "merged"
+        options = eval_view_options(eval_clouds[fold_id]["clouds_dir"], sample_key)
+        return options, "merged"
+
+    @app.callback(
         [Output("eval-pred-graph", "figure"), Output("eval-ref-graph", "figure")],
         [Input("eval-fold", "value"), Input("eval-sample", "value"),
-         Input("eval-zscale", "value")],
+         Input("eval-view", "value"), Input("eval-zscale", "value")],
     )
     def update_eval_graphs(fold_id: str | None, sample_key: str | None,
-                           z_scale: int) -> tuple:
+                           view_key: str | None, z_scale: int) -> tuple:
         if not fold_id or not sample_key or fold_id not in eval_clouds:
             empty = _empty("Select a fold and sample.")
             return empty, empty
         clouds_dir = eval_clouds[fold_id]["clouds_dir"]
         zs = float(z_scale or 1)
         try:
-            pred_pts = np.load(clouds_dir / f"{sample_key}_pred.npy").astype(np.float32)
-            ref_pts  = np.load(clouds_dir / f"{sample_key}_ref.npy").astype(np.float32)
+            pred_pts, ref_pts = load_eval_cloud_pair(clouds_dir, sample_key, view_key)
         except FileNotFoundError as exc:
             empty = _empty(f"Cloud file not found: {exc}")
             return empty, empty
         except Exception as exc:
             empty = _empty(f"Error loading clouds: {exc}")
+            return empty, empty
+        if len(pred_pts) == 0 or len(ref_pts) == 0:
+            empty = _empty("Selected cloud view has no points.")
             return empty, empty
 
         # Eval clouds are in NeRFStudio GPS world space (Z = height) after
@@ -573,6 +633,8 @@ def build_app(geometry_root: Path, vggt_root: Path, eval_root: Path | None = Non
         ref_pts  = _norm_display(ref_pts)
 
         def _height_fig(pts: np.ndarray, title: str, uirev: str) -> go.Figure:
+            if len(pts) == 0:
+                return _empty(f"No points for {title}.")
             z = pts[:, 2]
             z_col = (z - z.min()) / max(float(z.max() - z.min()), 1e-8)
             pts = pts.copy()
@@ -581,6 +643,8 @@ def build_app(geometry_root: Path, vggt_root: Path, eval_root: Path | None = Non
             return go.Figure(data=[trace], layout=go.Layout(**_layout(title, uirev)))
 
         label = _parse_sample_label(sample_key)
+        if view_key and view_key != "merged":
+            label = f"{label} · {view_key.replace('view_', 'view ')}"
         pred_fig = _height_fig(pred_pts, f"Prediction · {label}", "eval-pred")
         ref_fig  = _height_fig(ref_pts,  f"Reference  · {label}", "eval-ref")
         return pred_fig, ref_fig
@@ -653,4 +717,3 @@ def main() -> None:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()
-
