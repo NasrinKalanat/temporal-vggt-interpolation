@@ -1,0 +1,868 @@
+Here is the detailed implementation document.
+
+# Target-View Temporal VGGT Architecture
+
+## 1. Goal
+
+Implement a new temporal VGGT model that predicts the VGGT cached features for an intermediate target date `t2` using cached VGGT features from endpoint dates `t1` and `t3`.
+
+The model does not assume that `t1` and `t2` views are aligned. Instead, it explicitly uses the `t2` camera views as the target output canvas.
+
+The model predicts the four VGGT cached layers that are normally passed into the VGGT DPT point-map head:
+
+```text
+[4, 11, 17, 23]
+```
+
+The VGGT point-map head remains frozen. The model is trained only through cached-feature supervision.
+
+At inference time, the model uses:
+
+```text
+t1 cached features
+t3 cached features
+t1 camera views
+t3 camera views
+t2 camera views
+time/date features
+```
+
+It does not use `t2` RGB images at inference.
+
+---
+
+## 2. High-Level Architecture
+
+The model is a target-view temporal decoder.
+
+The main idea is:
+
+```text
+t1 cached features + t1 rays
+t3 cached features + t3 rays
+        ↓
+source memory tokens
+
+learned t2 query tokens + t2 rays
+        ↓
+target-view query tokens
+
+target-view query tokens cross-attend to source memory
+        ↓
+predicted t2 cached layers
+        ↓
+frozen VGGT point head
+        ↓
+predicted t2 point map
+```
+
+Unlike the residual endpoint model, this architecture does not use:
+
+```text
+pred_t2_cache = f1_cache + update
+```
+
+because `t1` and `t2` are not assumed to be view-consistent.
+
+Instead, the model generates the `t2` cached feature grid from target-view query tokens.
+
+---
+
+## 3. Inputs
+
+For each training sample, the model receives:
+
+```text
+cached_t1_layers
+cached_t3_layers
+camera_t1
+camera_t3
+camera_t2
+date_t1
+date_t2
+date_t3
+```
+
+During training only, the loss also uses:
+
+```text
+teacher_cached_t2_layers
+```
+
+where `teacher_cached_t2_layers` are extracted by running frozen VGGT on real `t2` images.
+
+---
+
+## 4. Tensor Shapes
+
+Let:
+
+```text
+B       = batch size
+S1      = number of t1 source views
+S3      = number of t3 source views
+S2      = number of target t2 views
+T       = 5 + P
+P       = number of patch tokens
+D       = original VGGT cached feature dimension = 2048
+d_model = bottleneck transformer dimension = 512
+```
+
+Each cached layer has shape:
+
+```text
+t1 cache layer:      [B, S1, T, 2048]
+t3 cache layer:      [B, S3, T, 2048]
+teacher t2 layer:   [B, S2, T, 2048]
+```
+
+The model predicts:
+
+```text
+predicted t2 layer: [B, S2, T, 2048]
+```
+
+The first five tokens are VGGT special tokens:
+
+```text
+tokens 0:5 = special tokens
+tokens 5:  = patch tokens
+```
+
+The cache loss is applied only to patch tokens.
+
+---
+
+## 5. Main Modules
+
+The model should contain the following modules.
+
+### 5.1 Down Projection
+
+Each source cached layer is projected from VGGT dimension `2048` to bottleneck dimension `512`.
+
+For each cached layer:
+
+```python
+f1_low = down_proj(layer_norm(f1_cache))
+f3_low = down_proj(layer_norm(f3_cache))
+```
+
+Shapes:
+
+```text
+f1_cache: [B, S1, T, 2048]
+f3_cache: [B, S3, T, 2048]
+
+f1_low:   [B, S1, T, 512]
+f3_low:   [B, S3, T, 512]
+```
+
+There should be one down-projection per cached layer.
+
+---
+
+### 5.2 Learned Target-View Query
+
+For each cached layer, create a learned `t2` query template.
+
+Parameter shape:
+
+```python
+learned_t2_query[layer]: [1, 1, T, 512]
+```
+
+At runtime, expand it to:
+
+```python
+t2_query = learned_t2_query[layer].expand(B, S2, T, 512)
+```
+
+Runtime shape:
+
+```text
+t2_query: [B, S2, T, 512]
+```
+
+This query represents an empty target-view feature grid for the `t2` camera views. It is not copied from `t1`.
+
+Each cached layer should have its own learned query parameter because different VGGT layers have different feature semantics.
+
+---
+
+### 5.3 Ray MLP
+
+The ray MLP converts per-patch camera ray geometry into token embeddings.
+
+Ray feature shape:
+
+```text
+ray_feat: [B, S, P, 8]
+```
+
+The eight ray features are:
+
+```text
+world ray direction:          3 values
+normalized camera center:     3 values
+normalized patch coordinates: 2 values
+```
+
+So:
+
+```text
+ray_dim = 8
+```
+
+The ray MLP maps:
+
+```text
+[B, S, P, 8] → [B, S, P, 512]
+```
+
+Implementation:
+
+```python
+class RayMLP(nn.Module):
+    def __init__(self, ray_dim=8, d_model=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(ray_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, ray_feat):
+        return self.net(ray_feat)
+```
+
+Ray embeddings are added only to patch tokens:
+
+```python
+special = tokens[:, :, :5, :]
+patches = tokens[:, :, 5:, :]
+
+patches = patches + ray_mlp(ray_feat)
+
+tokens = torch.cat([special, patches], dim=2)
+```
+
+This applies to:
+
+```text
+t1 source tokens
+t3 source tokens
+t2 target query tokens
+```
+
+---
+
+### 5.4 Time Conditioning
+
+Time conditioning is added to source and target tokens before the decoder.
+
+The time features should encode:
+
+```text
+date_t1
+date_t2
+date_t3
+tau = (t2 - t1) / (t3 - t1)
+left gap = t2 - t1
+right gap = t3 - t2
+total gap = t3 - t1
+```
+
+The time-conditioning module maps the time feature vector to `512` dimensions.
+
+For each temporal role:
+
+```text
+t1 source role
+t3 source role
+t2 target role
+```
+
+create a time embedding with shape:
+
+```text
+[B, 1, 1, 512]
+```
+
+Then add it to tokens:
+
+```python
+f1_low = f1_low + time_emb_t1
+f3_low = f3_low + time_emb_t3
+t2_query = t2_query + time_emb_t2
+```
+
+Time conditioning happens before the transformer decoder.
+
+---
+
+### 5.5 Source Memory Construction
+
+For each cached layer, after down-projection, time conditioning, and ray conditioning:
+
+```python
+f1_low: [B, S1, T, 512]
+f3_low: [B, S3, T, 512]
+```
+
+Flatten views and tokens:
+
+```python
+f1_mem = f1_low.reshape(B, S1 * T, 512)
+f3_mem = f3_low.reshape(B, S3 * T, 512)
+```
+
+Concatenate them:
+
+```python
+memory = torch.cat([f1_mem, f3_mem], dim=1)
+```
+
+Final memory shape:
+
+```text
+memory: [B, (S1 + S3) * T, 512]
+```
+
+---
+
+### 5.6 Target Query Construction
+
+For each cached layer:
+
+```python
+t2_query = learned_t2_query[layer].expand(B, S2, T, 512)
+```
+
+Add time conditioning:
+
+```python
+t2_query = t2_query + time_emb_t2
+```
+
+Add ray conditioning to patch tokens:
+
+```python
+special = t2_query[:, :, :5, :]
+patches = t2_query[:, :, 5:, :]
+
+patches = patches + ray_mlp(ray_feat_t2)
+
+t2_query = torch.cat([special, patches], dim=2)
+```
+
+Flatten for decoder input:
+
+```python
+query = t2_query.reshape(B, S2 * T, 512)
+```
+
+Shape:
+
+```text
+query: [B, S2 * T, 512]
+```
+
+---
+
+## 6. Temporal Decoder
+
+Each cached layer uses a one-block transformer decoder.
+
+The decoder receives:
+
+```text
+query  = target t2 query tokens
+memory = t1/t3 source tokens
+```
+
+The decoder block contains:
+
+```text
+self-attention on t2 query tokens
+cross-attention from t2 query tokens to t1/t3 memory
+MLP
+LayerNorm
+residual connections
+```
+
+The decoder uses:
+
+```text
+d_model = 512
+num_heads = 8
+mlp_ratio = 2.0
+dropout = 0.1
+num_decoder_blocks = 1
+```
+
+The decoder output shape is:
+
+```text
+h: [B, S2 * T, 512]
+```
+
+Reshape back to:
+
+```python
+h = h.reshape(B, S2, T, 512)
+```
+
+---
+
+## 7. Up Projection
+
+After the temporal decoder, project the target-view hidden tokens back to the VGGT cached feature dimension:
+
+```python
+pred_t2_cache = up_proj(h)
+```
+
+Shape:
+
+```text
+h:             [B, S2, T, 512]
+pred_t2_cache: [B, S2, T, 2048]
+```
+
+There is one up-projection per cached layer.
+
+The final model output is a list of four predicted cached layers:
+
+```python
+pred_cached_layers = [
+    pred_layer_4,
+    pred_layer_11,
+    pred_layer_17,
+    pred_layer_23,
+]
+```
+
+Each predicted layer has shape:
+
+```text
+[B, S2, T, 2048]
+```
+
+---
+
+## 8. Frozen VGGT Point Head
+
+The VGGT point-map head is copied from the pretrained VGGT model and frozen.
+
+```python
+for p in self.point_head.parameters():
+    p.requires_grad_(False)
+```
+
+The point head is not trained.
+
+The predicted cached layers can be passed to the frozen point head to decode a predicted `t2` point map.
+
+During the initial training stage, the point head is not part of the loss because the selected loss is cached-feature supervision only.
+
+---
+
+## 9. Training Target
+
+During training, frozen VGGT is run on real `t2` images to extract teacher cached layers:
+
+```python
+teacher_cached_t2 = frozen_vggt_extract_cached_layers(t2_images)
+```
+
+The teacher cached layers must correspond to the same `t2` cameras used to build the target query.
+
+For every cached layer:
+
+```text
+predicted t2 cache: [B, S2, T, 2048]
+teacher t2 cache:   [B, S2, T, 2048]
+```
+
+These shapes must match exactly.
+
+Add an assertion:
+
+```python
+assert pred.shape == teacher.shape
+```
+
+---
+
+## 10. Loss Function
+
+The training loss is:
+
+```text
+LayerNorm SmoothL1 cache loss + cosine cache loss
+```
+
+The loss is applied only to patch tokens.
+
+For each cached layer:
+
+```python
+pred_patch = pred_cache[:, :, 5:, :]
+teacher_patch = teacher_cache[:, :, 5:, :]
+```
+
+Normalize over the channel dimension:
+
+```python
+pred_norm = F.layer_norm(pred_patch, pred_patch.shape[-1:])
+teacher_norm = F.layer_norm(teacher_patch, teacher_patch.shape[-1:])
+```
+
+Compute Smooth L1:
+
+```python
+loss_smooth = F.smooth_l1_loss(
+    pred_norm,
+    teacher_norm,
+    beta=0.1,
+)
+```
+
+Compute cosine loss:
+
+```python
+pred_flat = pred_norm.reshape(-1, pred_norm.shape[-1])
+teacher_flat = teacher_norm.reshape(-1, teacher_norm.shape[-1])
+
+loss_cos = 1.0 - F.cosine_similarity(
+    pred_flat,
+    teacher_flat,
+    dim=-1,
+    eps=1e-6,
+).mean()
+```
+
+Layer loss:
+
+```python
+loss_layer = loss_smooth + 0.05 * loss_cos
+```
+
+Total cache loss across the four layers:
+
+```python
+loss_cache = sum(loss_layer_i for i in layers) / 4
+```
+
+Final training loss:
+
+```python
+loss = loss_cache
+```
+
+There is no point-map loss and no Chamfer loss in this implementation.
+
+---
+
+## 11. Loss Configuration
+
+Use the following loss configuration:
+
+```yaml
+loss:
+  cache_weight: 1.0
+  cache_loss_type: smooth_l1
+  cache_normalize: true
+  cache_patch_only: true
+  cache_smooth_l1_beta: 0.1
+  cache_cos_weight: 0.05
+
+  special_token_weight: 0.0
+  pointmap_weight: 0.0
+  chamfer_weight: 0.0
+```
+
+Only patch tokens are supervised.
+
+Special tokens are not included in the first implementation.
+
+---
+
+## 12. Forward Pass Pseudocode
+
+```python
+def forward(batch):
+    cached_t1 = batch["cached_t1_layers"]
+    cached_t3 = batch["cached_t3_layers"]
+
+    ray_feat_t1 = batch["ray_feat_t1"]
+    ray_feat_t3 = batch["ray_feat_t3"]
+    ray_feat_t2 = batch["ray_feat_t2"]
+
+    time_feat = batch["time_feat"]
+
+    pred_cached_layers = []
+
+    for layer_idx in range(4):
+        f1 = cached_t1[layer_idx]  # [B, S1, T, 2048]
+        f3 = cached_t3[layer_idx]  # [B, S3, T, 2048]
+
+        B, S1, T, _ = f1.shape
+        S3 = f3.shape[1]
+        S2 = ray_feat_t2.shape[1]
+
+        # 1. Down-project source caches
+        f1_low = down_proj[layer_idx](down_norm[layer_idx](f1))
+        f3_low = down_proj[layer_idx](down_norm[layer_idx](f3))
+
+        # 2. Add time embeddings
+        f1_low = f1_low + time_mlp_t1(time_feat)[:, None, None, :]
+        f3_low = f3_low + time_mlp_t3(time_feat)[:, None, None, :]
+
+        # 3. Add ray embeddings to source patch tokens
+        f1_low = add_ray_embedding(f1_low, ray_feat_t1)
+        f3_low = add_ray_embedding(f3_low, ray_feat_t3)
+
+        # 4. Build source memory
+        f1_mem = f1_low.reshape(B, S1 * T, d_model)
+        f3_mem = f3_low.reshape(B, S3 * T, d_model)
+        memory = torch.cat([f1_mem, f3_mem], dim=1)
+
+        # 5. Build target-view t2 query
+        t2_query = learned_t2_queries[layer_idx].expand(B, S2, T, d_model)
+        t2_query = t2_query + time_mlp_t2(time_feat)[:, None, None, :]
+        t2_query = add_ray_embedding(t2_query, ray_feat_t2)
+
+        query = t2_query.reshape(B, S2 * T, d_model)
+
+        # 6. Decode target-view t2 features
+        h = temporal_decoder[layer_idx](query=query, memory=memory)
+
+        h = h.reshape(B, S2, T, d_model)
+
+        # 7. Project back to VGGT cache dimension
+        pred = up_proj[layer_idx](up_norm[layer_idx](h))
+
+        pred_cached_layers.append(pred)
+
+    return {
+        "pred_cached_layers": pred_cached_layers
+    }
+```
+
+---
+
+## 13. Ray Feature Construction
+
+For each camera and patch token, compute a ray.
+
+For patch center pixel `(u, v)`:
+
+```python
+x = (u - cx) / fx
+y = (v - cy) / fy
+ray_cam = normalize([x, y, 1])
+```
+
+Transform to world coordinates:
+
+```python
+ray_world = R_cam_to_world @ ray_cam
+```
+
+The camera center is:
+
+```python
+C_world = camera_translation
+```
+
+Normalize camera centers per scene or triplet:
+
+```python
+C_norm = (C_world - scene_center) / scene_scale
+```
+
+Normalize patch coordinates:
+
+```python
+u_norm = 2 * (u / image_width) - 1
+v_norm = 2 * (v / image_height) - 1
+```
+
+The ray feature for each patch is:
+
+```python
+ray_feat = [
+    ray_world_x,
+    ray_world_y,
+    ray_world_z,
+    C_norm_x,
+    C_norm_y,
+    C_norm_z,
+    u_norm,
+    v_norm,
+]
+```
+
+Final ray tensor shapes:
+
+```text
+ray_feat_t1: [B, S1, P, 8]
+ray_feat_t3: [B, S3, P, 8]
+ray_feat_t2: [B, S2, P, 8]
+```
+
+---
+
+## 14. Training Behavior
+
+The model learns to predict the VGGT cached representation for the target `t2` views.
+
+The target-view query provides the output canvas. The source memory provides information from `t1` and `t3`.
+
+The loss directly forces:
+
+```text
+predicted t2 cached layers ≈ frozen VGGT t2 cached layers
+```
+
+Because the prediction and teacher are both in the `t2` camera-view grid, token-wise cached-feature loss is valid.
+
+---
+
+## 15. Inference Behavior
+
+At inference time, the model receives:
+
+```text
+t1 cached layers
+t3 cached layers
+t1 camera views
+t3 camera views
+target t2 camera views
+time/date features
+```
+
+It builds `t2` query tokens from:
+
+```text
+learned t2 query template
+t2 time embedding
+t2 ray embeddings
+```
+
+Then it predicts:
+
+```text
+predicted t2 cached layers
+```
+
+These predicted cached layers are passed into the frozen VGGT point head to decode the final point map.
+
+No `t2` RGB images are used at inference.
+
+---
+
+## 16. Configuration
+
+Use this model configuration:
+
+```yaml
+model:
+  name: target_view_temporal_vggt
+
+model_kwargs:
+  cached_layers: [4, 11, 17, 23]
+
+  vggt_dim: 2048
+  d_model: 512
+
+  num_decoder_blocks: 1
+  num_heads: 8
+  mlp_ratio: 2.0
+  dropout: 0.1
+
+  ray_dim: 8
+  patch_start_idx: 5
+
+  freeze_vggt_backbone: true
+  freeze_point_head: true
+  train_point_head: false
+
+loss:
+  cache_weight: 1.0
+  cache_loss_type: smooth_l1
+  cache_normalize: true
+  cache_patch_only: true
+  cache_smooth_l1_beta: 0.1
+  cache_cos_weight: 0.05
+
+  special_token_weight: 0.0
+  pointmap_weight: 0.0
+  chamfer_weight: 0.0
+```
+
+---
+
+## 17. Implementation Checklist
+
+The implementation should include:
+
+```text
+src/models/target_view_temporal_vggt.py
+```
+
+with:
+
+```text
+TargetViewTemporalVGGT
+RayMLP
+TargetViewTemporalDecoderBlock
+cached-feature prediction forward pass
+```
+
+The dataset or training pipeline should provide:
+
+```text
+cached_t1_layers
+cached_t3_layers
+teacher_cached_t2_layers
+ray_feat_t1
+ray_feat_t3
+ray_feat_t2
+time_feat
+```
+
+The training script should:
+
+```text
+load cached t1/t3 features
+load or compute teacher cached t2 features
+run the model
+compute cached-feature loss
+backpropagate only through the target-view temporal model
+keep VGGT and VGGT point head frozen
+```
+
+The loss function should assert shape equality:
+
+```python
+assert pred.shape == teacher.shape
+```
+
+for every cached layer.
+
+The final output of the model should be:
+
+```python
+{
+    "pred_cached_layers": pred_cached_layers
+}
+```
+
+where `pred_cached_layers` is a list of four tensors, each with shape:
+
+```text
+[B, S2, T, 2048]
+```

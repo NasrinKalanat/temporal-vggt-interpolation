@@ -1,0 +1,49 @@
+triplets_path: prepared_data/non_view_consistent_triplets.json
+output_root: vggt_outputs/non_view_consistent_v16_o8
+
+# Limit to specific entry IDs (e.g. "20230812_20230817_20230822_corn"). null = all.
+triplet_ids: null
+
+# Limit to specific crop types. null = all.
+crops: corn
+
+# Window size: number of views per variant for each of t1, t2, t3.
+n_views: 16
+
+# Max shared views between consecutive windows (stride = n_views - max_overlap_views).
+max_overlap_views: 4
+
+# Optional cap on sliding windows for each individual date. null = all windows.
+max_windows_per_date: null
+
+# Optional cap on final variants per (t1,t2,t3,crop) triplet. null = all combinations.
+max_variants_per_triplet: null
+
+# If true, skips combinations where t1/t2/t3 have the exact same frame-index window.
+require_distinct_view_windows: true
+
+# Random seed used only when max_variants_per_triplet is not null.
+seed: 42
+
+model_id: facebook/VGGT-1B
+device: cuda:7
+image_preprocess_mode: pad
+
+skip_existing: true
+
+# Only run VGGT inference for t2; write metadata for t1/t3 without predictions.
+t2_only: false
+
+# Which predictions/*.npy files to generate.
+# Use "all" (standard predictions + t2 cached layers), "none", or a list from:
+#   point_map, point_confidence, extrinsic, intrinsic,
+#   depth_map, depth_confidence, cached_layers
+# If set to "none", VGGT is not loaded and only metadata files are written.
+prediction_outputs: none
+
+# Legacy shortcut: if true and prediction_outputs is not set, generates only
+# point_map.npy and point_confidence.npy.
+point_map_only: false
+
+# Aggregator layer indices to cache for t2 (used as supervision targets).
+t2_cache_layers: [4, 11, 17, 23]

@@ -261,6 +261,32 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 
 # ─── t2 teacher cache ─────────────────────────────────────────────────────────
 
+def select_query_cached_views(
+    cached_layers: list[torch.Tensor],
+    query_view_indices: Any,
+    device: str,
+) -> list[torch.Tensor]:
+    """Select/reorder cached t2 features to match camera_t2_query view order."""
+    if query_view_indices is None:
+        return cached_layers
+    if torch.is_tensor(query_view_indices):
+        indices = query_view_indices.to(device=device, dtype=torch.long)
+    else:
+        indices = torch.tensor(query_view_indices, device=device, dtype=torch.long)
+    if indices.dim() == 1:
+        indices = indices.unsqueeze(0)
+
+    selected: list[torch.Tensor] = []
+    for layer in cached_layers:
+        if indices.max().item() >= layer.shape[1]:
+            raise RuntimeError(
+                f"query_view_indices max={indices.max().item()} exceeds cached t2 view count={layer.shape[1]}"
+            )
+        gather_idx = indices[:, :, None, None].expand(-1, -1, layer.shape[2], layer.shape[3])
+        selected.append(layer.gather(dim=1, index=gather_idx))
+    return selected
+
+
 def resolve_t2_teacher_cached(
     batch: dict,
     model: torch.nn.Module,
@@ -272,13 +298,18 @@ def resolve_t2_teacher_cached(
     """
     if not hasattr(model, "_run_vggt_endpoint") or model.aggregator is None:
         return None
-    return run_cached_endpoint(
+    cached_layers = run_cached_endpoint(
         model,
         batch.get("images_t2"),
         batch["date_t1"].shape[0],
         batch.get("t2_cache_key"),
         "t2",
     )
+    if getattr(model, "target_view_cache_requires_query_order", False):
+        cached_layers = select_query_cached_views(
+            cached_layers, batch.get("query_view_indices"), device
+        )
+    return cached_layers
 
 
 # ─── loss ─────────────────────────────────────────────────────────────────────

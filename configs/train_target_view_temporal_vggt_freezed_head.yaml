@@ -1,0 +1,127 @@
+# Target-View Temporal VGGT — Frozen Point Head + Cached Feature Supervision
+#
+# Predicts t2 cached VGGT layers on explicit t2 target camera views.
+# The VGGT point head is frozen/removed during training; loss is cached-feature
+# supervision against frozen VGGT t2 cached layers.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+output_root: runs/target_view_temporal_vggt_t1t2_paired_v16_o8_1layer_freezed_head
+
+vggt_inference_mode: precomputed
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+image_size: 518
+image_preprocess_mode: pad
+conf_threshold: 0.02
+feature_cache_root: /home/ec2-user/workspace/canopy-org/vggt_cache
+
+# ---------------------------------------------------------------------------
+# Frozen point head — skip DPTHead forward, free GPU memory
+# ---------------------------------------------------------------------------
+freeze_point_head: true
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+epochs: 50
+resume: false
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+early_stopping:
+  patience: 10
+  min_delta: 1.0e-4
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# LR scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# Loss — cached feature supervision only
+# ---------------------------------------------------------------------------
+loss:
+  pointmap_weight: 0.0
+  chamfer_weight: 0.0
+
+  cache_weight: 1.0
+  cache_smooth_l1_beta: 0.1
+  cache_cos_weight: 0.05
+  cache_normalize: true
+  cache_patch_only: true
+  special_token_weight: 0.0
+
+  delta_reg_weight: 0
+  gate_reg_weight: 0
+
+# ---------------------------------------------------------------------------
+# Teacher confidence handling (unused when pointmap_weight=0)
+# ---------------------------------------------------------------------------
+teacher:
+  conf_mask_threshold: 0.02
+  conf_threshold_type: absolute
+  use_weighted_reg_loss: false
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_module: models.target_view_temporal_vggt
+model_class: TargetViewTemporalVGGT
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024
+  vggt_dim: 2048
+  d_model: 512
+  num_query_views: 16
+
+  # Target-view decoder
+  num_decoder_blocks: 1
+  num_heads: 8
+  mlp_ratio: 2.0
+  dropout: 0.1
+
+  # Ray/time conditioning
+  ray_dim: 8
+  time_hidden_dim: 256
+  image_size: 518
+  patch_size: 14
+  patch_start_idx: 5
+  image_preprocess_mode: pad
+
+  # Frozen VGGT / point head
+  init_point_head_from_vggt: true
+  cache_layers: [4, 11, 17, 23]
+  freeze_point_head: true
+
+  # Spatial attention
+  use_rope_in_self_attention: true
+
+  # Memory
+  use_gradient_checkpoint: false

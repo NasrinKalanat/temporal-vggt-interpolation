@@ -259,6 +259,88 @@ vggt_outputs/t1t2_paired_v16_o4/
         └── t3/   (same)
 ```
 
+**Non-view-consistent triplets** — keeps the same temporal logic (`t1 < t2 < t3`) but does not match camera views across dates. Each triplet stores all available views for t1, t2, and t3 independently; the inference script later builds variants from separate sliding windows for each date.
+
+```bash
+conda run -n 4d python src/vggt_pipeline/non_view_consistent_triplets.py \
+    --config configs/non_view_consistent_triplets.yaml
+```
+
+Output: `prepared_data/non_view_consistent_triplets.json` (configurable via `output_path`).
+
+Each entry contains:
+- `views_t1` — all t1 views in t2's coordinate system
+- `views_t2` — all t2 views
+- `views_t3` — all t3 views in t2's coordinate system
+
+Key config options (`configs/non_view_consistent_triplets.yaml`):
+
+```yaml
+selected_dates: []          # ordered date strings to include
+selected_crops: []          # crop names to include
+output_path: prepared_data/non_view_consistent_triplets.json
+```
+
+Then run VGGT inference using independent t1/t2/t3 view windows:
+
+```bash
+conda run -n 4d python src/vggt_pipeline/run_non_view_consistent_inference.py \
+    --config configs/non_view_consistent_inference.yaml
+```
+
+Variant generation:
+- **t1 window**: sliding window over `views_t1`
+- **t2 window**: sliding window over `views_t2`
+- **t3 window**: sliding window over `views_t3`
+- **All variants**: every `(t1_window, t2_window, t3_window)` combination when `max_variants_per_triplet: null`
+- **Limited variants**: deterministic random sample when `max_variants_per_triplet` is an integer
+- **Variant naming**: `variant_{t1_idx:02d}_{t2_idx:02d}_{t3_idx:02d}`
+
+Key config options (`configs/non_view_consistent_inference.yaml`):
+
+```yaml
+triplets_path: prepared_data/non_view_consistent_triplets.json
+output_root: vggt_outputs/non_view_consistent_v16_o8
+n_views: 16
+max_overlap_views: 8
+max_windows_per_date: null        # cap windows for each date (null = all)
+max_variants_per_triplet: null    # cap final variants per triplet (null = all)
+require_distinct_view_windows: true
+seed: 42
+prediction_outputs: none          # metadata-only; use "all" or a list to run VGGT
+t2_cache_layers: [4, 11, 17, 23]
+```
+
+Dry-run variant counts without loading VGGT:
+
+```bash
+conda run -n 4d python src/vggt_pipeline/run_non_view_consistent_inference.py \
+    --config configs/non_view_consistent_inference.yaml \
+    --dry-run
+```
+
+Multi-GPU sharding uses the same rank arguments as the paired inference script:
+
+```bash
+for r in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$r conda run -n 4d python src/vggt_pipeline/run_non_view_consistent_inference.py \
+    --config configs/non_view_consistent_inference.yaml \
+    --num-gpus 8 --gpu-rank $r --device cuda:0 &
+done
+wait
+```
+
+Output layout:
+
+```
+vggt_outputs/non_view_consistent_v16_o8/
+└── {t1}_{t2}_{t3}_{crop}/
+    └── variant_{t1_idx:02d}_{t2_idx:02d}_{t3_idx:02d}/
+        ├── t1/   (dataset_cameras.json, selected_images.json[, predictions/])
+        ├── t2/   (same)
+        └── t3/   (same)
+```
+
 ### Step 4 — Visualize (optional)
 
 Interactive browser-based 3D viewer for geometry assets and model evaluation results.
@@ -396,6 +478,8 @@ temporal_vggt/
   configs/
     prepare_data.yaml       dataset scanning settings (matic platform, 20230812–20230922)
     vggt_inference.yaml     VGGT inference settings (n_views, max_overlap_views)
+    non_view_consistent_triplets.yaml   independent-view triplet generation
+    non_view_consistent_inference.yaml  independent-view VGGT inference variants
     train_model_v1.yaml     v1 training config (patch-level time conditioning)
     train_model_v2.yaml     v2 training config (+ block-level time conditioning at LoRA layers)
   docs/                     project documentation
@@ -404,6 +488,8 @@ temporal_vggt/
     vggt_pipeline/
       execute_vggt.py           VGGT model loading and forward pass
       run_vggt_inference.py     scene-level inference; produces views_NN/ variants per scene
+      non_view_consistent_triplets.py      build t1/t2/t3 triplets with independent view pools
+      run_non_view_consistent_inference.py build/run independent t1/t2/t3 window variants
       build_geometry_assets.py  fuse point maps → aligned + normalized point clouds
     data_prep/
       build_available_triplets.py  scan vggt_output/ and build triplets from completed variants
