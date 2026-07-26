@@ -115,6 +115,7 @@ model_kwargs:
   patch_size: 14
   patch_start_idx: 5
   image_preprocess_mode: pad
+  camera_ray_convention: opengl
 
   # Frozen VGGT / point head
   init_point_head_from_vggt: true

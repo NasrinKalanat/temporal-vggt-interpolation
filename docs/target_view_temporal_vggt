@@ -247,6 +247,20 @@ patches = patches + ray_mlp(ray_feat)
 tokens = torch.cat([special, patches], dim=2)
 ```
 
+The final RayMLP layer is initialized with small nonzero weights so the ray
+path starts nearly neutral but remains trainable:
+
+```python
+nn.init.normal_(ray_mlp.net[2].weight, std=1e-4)
+nn.init.zeros_(ray_mlp.net[2].bias)
+```
+
+The model also has a learnable `ray_scale` initialized to `1.0`:
+
+```python
+patches = patches + ray_scale * ray_mlp(ray_feat)
+```
+
 This applies to:
 
 ```text
@@ -401,6 +415,10 @@ dropout = 0.1
 num_decoder_blocks = 1
 self_attention_scope = per_view
 ```
+
+The decoder stack is layer-specific. Layers `4`, `11`, `17`, and `23` each use
+their own decoder blocks instead of sharing one decoder across all cached
+feature levels.
 
 With `self_attention_scope: per_view`, the target query is reshaped before
 the decoder:
@@ -665,10 +683,17 @@ def forward(batch):
         t2_query = t2_query + time_mlp_t2(time_feat)[:, None, None, :]
         t2_query = add_ray_embedding(t2_query, ray_feat_t2)
 
-        query = t2_query.reshape(B, S2 * T, d_model)
+        if self_attention_scope == "per_view":
+            query = t2_query.reshape(B * S2, T, d_model)
+            memory_for_decoder = memory[:, None].expand(
+                B, S2, memory.shape[1], d_model
+            ).reshape(B * S2, memory.shape[1], d_model)
+        else:
+            query = t2_query.reshape(B, S2 * T, d_model)
+            memory_for_decoder = memory
 
         # 6. Decode target-view t2 features
-        h = temporal_decoder[layer_idx](query=query, memory=memory)
+        h = temporal_decoder[layer_idx](query=query, memory=memory_for_decoder)
 
         h = h.reshape(B, S2, T, d_model)
 
@@ -688,12 +713,26 @@ def forward(batch):
 
 For each camera and patch token, compute a ray.
 
-For patch center pixel `(u, v)`:
+For patch center pixel `(u, v)`, first compute normalized image coordinates:
 
 ```python
 x = (u - cx) / fx
 y = (v - cy) / fy
-ray_cam = normalize([x, y, 1])
+```
+
+The camera-frame ray then depends on `camera_ray_convention`:
+
+```python
+plus_z / opencv: ray_cam = normalize([x,  y,  1])
+minus_z:         ray_cam = normalize([x,  y, -1])
+opengl:          ray_cam = normalize([x, -y, -1])
+```
+
+For the Nerfstudio/OpenGL transform convention used by these triplets, the
+target-view config sets:
+
+```yaml
+camera_ray_convention: opengl
 ```
 
 Transform to world coordinates:

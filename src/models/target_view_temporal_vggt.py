@@ -41,6 +41,13 @@ class RayMLP(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.net[0].weight)
+        nn.init.zeros_(self.net[0].bias)
+        nn.init.normal_(self.net[2].weight, std=1e-4)
+        nn.init.zeros_(self.net[2].bias)
 
     def forward(self, ray_feat: torch.Tensor) -> torch.Tensor:
         return self.net(ray_feat)
@@ -159,6 +166,7 @@ class TargetViewTemporalVGGT(nn.Module):
         image_size: int = 518,
         patch_size: int = 14,
         image_preprocess_mode: str = "pad",
+        camera_ray_convention: str = "plus_z",
         use_rope_in_self_attention: bool = True,
         self_attention_scope: str = "per_view",
         init_point_head_from_vggt: bool = True,
@@ -191,11 +199,20 @@ class TargetViewTemporalVGGT(nn.Module):
         self.num_patch_tokens = self.patch_h * self.patch_w
         self.num_tokens = patch_start_idx + self.num_patch_tokens
         self.use_gradient_checkpoint = use_gradient_checkpoint
+        if camera_ray_convention not in {"plus_z", "minus_z", "opencv", "opengl"}:
+            raise ValueError(
+                "camera_ray_convention must be one of "
+                f"'plus_z', 'minus_z', 'opencv', or 'opengl'; got {camera_ray_convention!r}"
+            )
+        self.camera_ray_convention = camera_ray_convention
+        logger.info("Using camera_ray_convention=%s", self.camera_ray_convention)
         if self_attention_scope not in {"per_view", "global"}:
             raise ValueError(
                 f"self_attention_scope must be 'per_view' or 'global', got {self_attention_scope!r}"
             )
         self.self_attention_scope = self_attention_scope
+        self._logged_ray_direction_roles = set()
+        self._logged_ray_norm_ratio = False
 
         num_layers = num_transformer_layers if num_transformer_layers is not None else num_decoder_blocks
         heads = num_transformer_heads if num_transformer_heads is not None else num_heads
@@ -228,19 +245,23 @@ class TargetViewTemporalVGGT(nn.Module):
             nn.init.trunc_normal_(query, std=0.02)
 
         self.ray_mlp = RayMLP(ray_dim=ray_dim, d_model=d_model)
+        self.ray_scale = nn.Parameter(torch.tensor(1.0))
         self.time_encoder = EndpointTimeEncoder(out_dim=d_model, hidden_dim=time_hidden_dim)
 
         rope = RotaryPositionEmbedding2D(frequency=100) if use_rope_in_self_attention else None
         self.position_getter = PositionGetter()
-        self.decoder_blocks = nn.ModuleList([
-            TargetViewTemporalDecoderBlock(
-                dim=d_model,
-                num_heads=heads,
-                mlp_ratio=mlp_ratio,
-                dropout=dropout,
-                rope=rope,
-            )
-            for _ in range(num_layers)
+        self.decoder_blocks_per_layer = nn.ModuleList([
+            nn.ModuleList([
+                TargetViewTemporalDecoderBlock(
+                    dim=d_model,
+                    num_heads=heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    rope=rope,
+                )
+                for _ in range(num_layers)
+            ])
+            for _ in self.cache_layers
         ])
 
         if init_point_head_from_vggt and vggt is not None and vggt.point_head is not None:
@@ -357,7 +378,12 @@ class TargetViewTemporalVGGT(nn.Module):
         height = torch.as_tensor(self.image_size, dtype=fl_x.dtype, device=fl_x.device)
         return fl_x * (width / img_w), fl_y * (height / img_h), cx * (width / img_w), cy * (height / img_h)
 
-    def _build_ray_features(self, camera: Dict[str, torch.Tensor], num_patch_tokens: int) -> torch.Tensor:
+    def _build_ray_features(
+        self,
+        camera: Dict[str, torch.Tensor],
+        num_patch_tokens: int,
+        role: str,
+    ) -> torch.Tensor:
         if num_patch_tokens != self.num_patch_tokens:
             side = int(math.sqrt(num_patch_tokens))
             if side * side != num_patch_tokens:
@@ -382,13 +408,22 @@ class TargetViewTemporalVGGT(nn.Module):
         fl_x, fl_y, cx, cy = self._scaled_intrinsics(camera)
         x_cam = (u - cx.unsqueeze(-1)) / fl_x.unsqueeze(-1)
         y_cam = (v - cy.unsqueeze(-1)) / fl_y.unsqueeze(-1)
-        z_cam = torch.ones_like(x_cam)
-        ray_cam = F.normalize(torch.stack([x_cam, y_cam, z_cam], dim=-1), dim=-1)
+
+        if self.camera_ray_convention in {"plus_z", "opencv"}:
+            ray_cam = torch.stack([x_cam, y_cam, torch.ones_like(x_cam)], dim=-1)
+        elif self.camera_ray_convention == "minus_z":
+            ray_cam = torch.stack([x_cam, y_cam, -torch.ones_like(x_cam)], dim=-1)
+        elif self.camera_ray_convention == "opengl":
+            ray_cam = torch.stack([x_cam, -y_cam, -torch.ones_like(x_cam)], dim=-1)
+        else:
+            raise ValueError(f"Unknown camera_ray_convention: {self.camera_ray_convention}")
+        ray_cam = F.normalize(ray_cam, dim=-1)
 
         transform = camera["transform_matrix"]
         rotation = transform[..., :3, :3]
         ray_world = torch.einsum("bsij,bspj->bspi", rotation, ray_cam)
         ray_world = F.normalize(ray_world, dim=-1)
+        self._maybe_log_ray_direction(camera, ray_world, role)
 
         center = transform[..., :3, 3]
         avg_pos = camera["avg_pos"].to(center)
@@ -401,6 +436,31 @@ class TargetViewTemporalVGGT(nn.Module):
 
         return torch.cat([ray_world, center_norm, u_norm, v_norm], dim=-1)
 
+    def _maybe_log_ray_direction(
+        self,
+        camera: Dict[str, torch.Tensor],
+        ray_world: torch.Tensor,
+        role: str,
+    ) -> None:
+        if role in self._logged_ray_direction_roles:
+            return
+        self._logged_ray_direction_roles.add(role)
+
+        with torch.no_grad():
+            center = camera["transform_matrix"][..., :3, 3]
+            scene_center = camera["avg_pos"].to(center)
+            center_ray = ray_world[:, :, ray_world.shape[2] // 2, :]
+
+            to_scene = scene_center[:, None, :] - center
+            to_scene = F.normalize(to_scene, dim=-1)
+            cos = (center_ray * to_scene).sum(dim=-1)
+            logger.info(
+                "Ray direction debug (%s, %s): mean center-ray-to-scene cosine = %.4f",
+                role,
+                self.camera_ray_convention,
+                cos.mean().item(),
+            )
+
     def _add_ray_embedding(self, tokens: torch.Tensor, ray_feat: torch.Tensor) -> torch.Tensor:
         special = tokens[:, :, : self.patch_start_idx]
         patches = tokens[:, :, self.patch_start_idx :]
@@ -409,7 +469,13 @@ class TargetViewTemporalVGGT(nn.Module):
                 f"Ray/token patch mismatch: tokens have {patches.shape[2]} patches, "
                 f"rays have {ray_feat.shape[2]}."
             )
-        patches = patches + self.ray_mlp(ray_feat)
+        ray_emb = self.ray_mlp(ray_feat)
+        if not self._logged_ray_norm_ratio:
+            self._logged_ray_norm_ratio = True
+            with torch.no_grad():
+                ratio = ray_emb.norm(dim=-1).mean() / (patches.norm(dim=-1).mean() + 1e-6)
+                logger.info("Ray embedding norm ratio: %.6f", ratio.item())
+        patches = patches + self.ray_scale * ray_emb
         return torch.cat([special, patches], dim=2)
 
     def _token_positions(
@@ -483,9 +549,9 @@ class TargetViewTemporalVGGT(nn.Module):
                 "Set image_size/patch_size/patch_start_idx to match the cached features."
             )
 
-        ray_t1 = self._build_ray_features(camera_t1, num_patch_tokens)
-        ray_t3 = self._build_ray_features(camera_t3, num_patch_tokens)
-        ray_t2 = self._build_ray_features(camera_t2, num_patch_tokens)
+        ray_t1 = self._build_ray_features(camera_t1, num_patch_tokens, "t1")
+        ray_t3 = self._build_ray_features(camera_t3, num_patch_tokens, "t3")
+        ray_t2 = self._build_ray_features(camera_t2, num_patch_tokens, "t2")
 
         time_t1 = self._time_offset(date_t1, date_t2, rel_gap)
         time_t3 = self._time_offset(date_t3, date_t2, rel_gap)
@@ -529,7 +595,7 @@ class TargetViewTemporalVGGT(nn.Module):
             del target_query
 
             hidden = query
-            for block in self.decoder_blocks:
+            for block in self.decoder_blocks_per_layer[layer_idx]:
                 if self.use_gradient_checkpoint and self.training:
                     hidden = grad_checkpoint(
                         block, hidden, memory_for_decoder, pos_t2, use_reentrant=False
