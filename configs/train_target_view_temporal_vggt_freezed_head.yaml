@@ -5,8 +5,8 @@
 # supervision against frozen VGGT t2 cached layers.
 
 triplets_path: prepared_data/subsets/benchmark_triplets.json
-vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
-output_root: runs/target_view_temporal_vggt_t1t2_paired_v16_o8_1layer_freezed_head
+vggt_output_root: vggt_outputs/non_view_consistent_v16_o4
+output_root: runs/target_view_temporal_vggt_non_view_consistent_v16_o4_1layer_freezed_head
 
 vggt_inference_mode: precomputed
 
@@ -22,7 +22,7 @@ seed: 42
 image_size: 518
 image_preprocess_mode: pad
 conf_threshold: 0.02
-feature_cache_root: /home/ec2-user/workspace/canopy-org/vggt_cache
+feature_cache_root: /mnt/data/temporal-vggt-interpolation/vggt_outputs/vggt_cache_target_view
 
 # ---------------------------------------------------------------------------
 # Frozen point head — skip DPTHead forward, free GPU memory
@@ -32,26 +32,26 @@ freeze_point_head: true
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-epochs: 50
+epochs: 150
 resume: false
 batch_size: 1
 num_workers: 2
 val_every: 1
 device: cuda:0
-grad_clip: 1.0
+grad_clip: 0.5
 
 # ---------------------------------------------------------------------------
 # Early stopping
 # ---------------------------------------------------------------------------
 early_stopping:
-  patience: 10
-  min_delta: 1.0e-4
+  patience: 20
+  min_delta: 5.0e-5
 
 # ---------------------------------------------------------------------------
 # Optimizer
 # ---------------------------------------------------------------------------
 optimizer:
-  lr: 1.0e-5
+  lr: 2.0e-5
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
 
@@ -59,7 +59,7 @@ optimizer:
 # LR scheduler
 # ---------------------------------------------------------------------------
 scheduler:
-  warmup_epochs: 5
+  warmup_epochs: 10
   min_lr: 1.0e-6
 
 # ---------------------------------------------------------------------------

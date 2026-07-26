@@ -1,5 +1,5 @@
 triplets_path: prepared_data/non_view_consistent_triplets.json
-output_root: vggt_outputs/non_view_consistent_v16_o8
+output_root: vggt_outputs/non_view_consistent_v16_o4
 
 # Limit to specific entry IDs (e.g. "20230812_20230817_20230822_corn"). null = all.
 triplet_ids: null
@@ -17,10 +17,10 @@ max_overlap_views: 4
 max_windows_per_date: null
 
 # Optional cap on final variants per (t1,t2,t3,crop) triplet. null = all combinations.
-max_variants_per_triplet: null
+max_variants_per_triplet: 100
 
 # If true, skips combinations where t1/t2/t3 have the exact same frame-index window.
-require_distinct_view_windows: true
+require_distinct_view_windows: false
 
 # Random seed used only when max_variants_per_triplet is not null.
 seed: 42
