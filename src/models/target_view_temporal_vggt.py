@@ -119,6 +119,14 @@ class TargetViewTemporalDecoderBlock(nn.Module):
         memory: torch.Tensor,
         pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        query = self.self_attention(query, pos)
+        return self.cross_attention_ffn(query, memory)
+
+    def self_attention(
+        self,
+        query: torch.Tensor,
+        pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         batch, num_tokens, channels = query.shape
         heads, head_dim = self.num_heads, self.head_dim
 
@@ -134,7 +142,13 @@ class TargetViewTemporalDecoderBlock(nn.Module):
             q_heads, k_heads, v_heads,
             dropout_p=self.attn_dropout if self.training else 0.0,
         )
-        query = query + self.out_sa(attn_out.transpose(1, 2).reshape(batch, num_tokens, channels))
+        return query + self.out_sa(attn_out.transpose(1, 2).reshape(batch, num_tokens, channels))
+
+    def cross_attention_ffn(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
         query = self.cross_attn(query, memory)
         query = query + self.ffn(self.norm_ffn(query))
         return query
@@ -461,15 +475,23 @@ class TargetViewTemporalVGGT(nn.Module):
                 cos.mean().item(),
             )
 
-    def _add_ray_embedding(self, tokens: torch.Tensor, ray_feat: torch.Tensor) -> torch.Tensor:
+    def _add_ray_embedding(
+        self,
+        tokens: torch.Tensor,
+        ray_feat: Optional[torch.Tensor] = None,
+        ray_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         special = tokens[:, :, : self.patch_start_idx]
         patches = tokens[:, :, self.patch_start_idx :]
-        if patches.shape[2] != ray_feat.shape[2]:
+        if ray_emb is None:
+            if ray_feat is None:
+                raise ValueError("Either ray_feat or ray_emb must be provided.")
+            ray_emb = self.ray_mlp(ray_feat)
+        if patches.shape[2] != ray_emb.shape[2]:
             raise ValueError(
                 f"Ray/token patch mismatch: tokens have {patches.shape[2]} patches, "
-                f"rays have {ray_feat.shape[2]}."
+                f"rays have {ray_emb.shape[2]}."
             )
-        ray_emb = self.ray_mlp(ray_feat)
         if not self._logged_ray_norm_ratio:
             self._logged_ray_norm_ratio = True
             with torch.no_grad():
@@ -505,6 +527,21 @@ class TargetViewTemporalVGGT(nn.Module):
             dtype=patch_pos.dtype,
         )
         return torch.cat([special_pos, patch_pos], dim=1)
+
+    def _run_per_view_decoder_block(
+        self,
+        block: TargetViewTemporalDecoderBlock,
+        hidden: torch.Tensor,
+        memory: torch.Tensor,
+        pos: Optional[torch.Tensor],
+        batch_size: int,
+        num_t2: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        hidden = block.self_attention(hidden, pos)
+        hidden = hidden.reshape(batch_size, num_t2 * num_tokens, self.d_model)
+        hidden = block.cross_attention_ffn(hidden, memory)
+        return hidden.reshape(batch_size * num_t2, num_tokens, self.d_model)
 
     def forward(self, batch: Dict) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
@@ -552,6 +589,9 @@ class TargetViewTemporalVGGT(nn.Module):
         ray_t1 = self._build_ray_features(camera_t1, num_patch_tokens, "t1")
         ray_t3 = self._build_ray_features(camera_t3, num_patch_tokens, "t3")
         ray_t2 = self._build_ray_features(camera_t2, num_patch_tokens, "t2")
+        ray_emb_t1 = self.ray_mlp(ray_t1)
+        ray_emb_t3 = self.ray_mlp(ray_t3)
+        ray_emb_t2 = self.ray_mlp(ray_t2)
 
         time_t1 = self._time_offset(date_t1, date_t2, rel_gap)
         time_t3 = self._time_offset(date_t3, date_t2, rel_gap)
@@ -568,8 +608,8 @@ class TargetViewTemporalVGGT(nn.Module):
 
             f1_low = self.down_projs[layer_idx](self.down_norms[layer_idx](f1))
             f3_low = self.down_projs[layer_idx](self.down_norms[layer_idx](f3))
-            f1_low = self._add_ray_embedding(f1_low + time_t1, ray_t1)
-            f3_low = self._add_ray_embedding(f3_low + time_t3, ray_t3)
+            f1_low = self._add_ray_embedding(f1_low + time_t1, ray_emb=ray_emb_t1)
+            f3_low = self._add_ray_embedding(f3_low + time_t3, ray_emb=ray_emb_t3)
 
             memory = torch.cat(
                 [
@@ -583,12 +623,10 @@ class TargetViewTemporalVGGT(nn.Module):
             target_query = self.learned_t2_queries[layer_idx].expand(
                 batch_size, num_t2, num_tokens, self.d_model
             )
-            target_query = self._add_ray_embedding(target_query + time_t2, ray_t2)
+            target_query = self._add_ray_embedding(target_query + time_t2, ray_emb=ray_emb_t2)
             if self.self_attention_scope == "per_view":
                 query = target_query.reshape(batch_size * num_t2, num_tokens, self.d_model)
-                memory_for_decoder = memory[:, None].expand(
-                    batch_size, num_t2, memory.shape[1], self.d_model
-                ).reshape(batch_size * num_t2, memory.shape[1], self.d_model)
+                memory_for_decoder = memory
             else:
                 query = target_query.reshape(batch_size, num_t2 * num_tokens, self.d_model)
                 memory_for_decoder = memory
@@ -597,11 +635,28 @@ class TargetViewTemporalVGGT(nn.Module):
             hidden = query
             for block in self.decoder_blocks_per_layer[layer_idx]:
                 if self.use_gradient_checkpoint and self.training:
-                    hidden = grad_checkpoint(
-                        block, hidden, memory_for_decoder, pos_t2, use_reentrant=False
-                    )
+                    if self.self_attention_scope == "per_view":
+                        hidden = grad_checkpoint(
+                            lambda h, m, p, block=block: self._run_per_view_decoder_block(
+                                block, h, m, p, batch_size, num_t2, num_tokens
+                            ),
+                            hidden,
+                            memory_for_decoder,
+                            pos_t2,
+                            use_reentrant=False,
+                        )
+                    else:
+                        hidden = grad_checkpoint(
+                            block, hidden, memory_for_decoder, pos_t2, use_reentrant=False
+                        )
                 else:
-                    hidden = block(hidden, memory_for_decoder, pos_t2)
+                    if self.self_attention_scope == "per_view":
+                        hidden = self._run_per_view_decoder_block(
+                            block, hidden, memory_for_decoder, pos_t2,
+                            batch_size, num_t2, num_tokens,
+                        )
+                    else:
+                        hidden = block(hidden, memory_for_decoder, pos_t2)
             del memory, memory_for_decoder
 
             hidden = hidden.reshape(batch_size, num_t2, num_tokens, self.d_model)

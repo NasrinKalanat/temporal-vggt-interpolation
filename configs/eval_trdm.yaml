@@ -1,0 +1,41 @@
+# Evaluate TRDM depth predictions by unprojecting D2_hat into t2 geometry.
+
+model_class: trpm.trdm_model.TRDM
+
+vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+runs_root: runs/trdm_t1t2_paired_v16_o8
+output_root: evaluation/trdm_t1t2_paired_v16_o8
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+device: auto
+image_preprocess_mode: pad
+
+conf_threshold: 0.02
+pred_conf_threshold: 0.0
+n_points: 50000
+distance_threshold: 0.05
+voxel_size: 0.05
+eval_alpha: 0.5
+eval_beta: 0.5
+save_clouds: true
+baselines_only: false
+
+model_kwargs:
+  input_channels: 9
+  base_channels: 32
+  context_dim: 128
+  pose_dim: 128
+  time_dim: 128
+  cond_dim: 256
+  t3_context_samples: 4096
+  conf_threshold: 0.02
+  eps: 1.0e-4

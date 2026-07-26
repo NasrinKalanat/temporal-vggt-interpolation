@@ -1,0 +1,64 @@
+# TRDM: Temporal Residual Depth-Map Network
+#
+# Predicts target-view t2 depth from t1/t3 depth maps, then unprojects depth
+# to geometry only during evaluation/export.
+
+model_class: trpm.trdm_model.TRDM
+
+vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+output_root: runs/trdm_t1t2_paired_v16_o8
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+val_date: null
+
+seed: 42
+device: cuda:0
+image_preprocess_mode: pad
+
+epochs: 100
+batch_size: 8
+num_workers: 4
+val_every: 1
+grad_clip: 1.0
+
+optimizer:
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+early_stopping:
+  patience: 15
+  min_delta: 1.0e-4
+
+loss:
+  log_depth_weight: 1.0
+  depth_gradient_weight: 0.2
+  depth_chamfer_weight: 0.01
+  residual_weight: 0.01
+  gate_weight: 0.001
+  conf_threshold: 0.02
+  depth_smooth_l1_beta: 0.05
+  chamfer_num_points: 4096
+  eps: 1.0e-4
+
+model_kwargs:
+  input_channels: 9
+  base_channels: 32
+  context_dim: 128
+  pose_dim: 128
+  time_dim: 128
+  cond_dim: 256
+  t3_context_samples: 4096
+  conf_threshold: 0.02
+  eps: 1.0e-4
