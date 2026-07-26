@@ -106,6 +106,7 @@ model_kwargs:
   num_heads: 8
   mlp_ratio: 2.0
   dropout: 0.1
+  self_attention_scope: per_view
 
   # Ray/time conditioning
   ray_dim: 8

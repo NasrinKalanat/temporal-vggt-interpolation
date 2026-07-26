@@ -384,8 +384,8 @@ memory = t1/t3 source tokens
 The decoder block contains:
 
 ```text
-self-attention on t2 query tokens
-cross-attention from t2 query tokens to t1/t3 memory
+self-attention on t2 query tokens, independently per target view
+cross-attention from each t2 target view to t1/t3 memory
 MLP
 LayerNorm
 residual connections
@@ -399,18 +399,49 @@ num_heads = 8
 mlp_ratio = 2.0
 dropout = 0.1
 num_decoder_blocks = 1
+self_attention_scope = per_view
 ```
 
-The decoder output shape is:
-
-```text
-h: [B, S2 * T, 512]
-```
-
-Reshape back to:
+With `self_attention_scope: per_view`, the target query is reshaped before
+the decoder:
 
 ```python
-h = h.reshape(B, S2, T, 512)
+query = t2_query.reshape(B * S2, T, 512)
+```
+
+The self-attention shapes are:
+
+```text
+query input: [B * S2, T, 512]
+Q/K/V:       [B * S2, num_heads, T, 64]
+attn map:    [B * S2, num_heads, T, T]
+```
+
+So self-attention is across tokens/patches inside each view, not across
+different target views.
+
+For cross-attention, the same source memory is made available to each target
+view independently:
+
+```text
+memory:      [B * S2, (S1 + S3) * T, 512]
+cross attn:  [B * S2, num_heads, T, (S1 + S3) * T]
+```
+
+This means target views do not self-attend to one another, but each target view
+can still read all source-view evidence from `t1` and `t3`.
+
+The decoder output is reshaped back to:
+
+```text
+h: [B, S2, T, 512]
+```
+
+If `self_attention_scope: global` is used, the older behavior is preserved:
+
+```text
+self-attention input: [B, S2 * T, 512]
+self-attention map:   [B, num_heads, S2 * T, S2 * T]
 ```
 
 ---

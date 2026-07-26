@@ -160,6 +160,7 @@ class TargetViewTemporalVGGT(nn.Module):
         patch_size: int = 14,
         image_preprocess_mode: str = "pad",
         use_rope_in_self_attention: bool = True,
+        self_attention_scope: str = "per_view",
         init_point_head_from_vggt: bool = True,
         use_gradient_checkpoint: bool = False,
         skip_aggregator: bool = False,
@@ -190,6 +191,11 @@ class TargetViewTemporalVGGT(nn.Module):
         self.num_patch_tokens = self.patch_h * self.patch_w
         self.num_tokens = patch_start_idx + self.num_patch_tokens
         self.use_gradient_checkpoint = use_gradient_checkpoint
+        if self_attention_scope not in {"per_view", "global"}:
+            raise ValueError(
+                f"self_attention_scope must be 'per_view' or 'global', got {self_attention_scope!r}"
+            )
+        self.self_attention_scope = self_attention_scope
 
         num_layers = num_transformer_layers if num_transformer_layers is not None else num_decoder_blocks
         heads = num_transformer_heads if num_transformer_heads is not None else num_heads
@@ -406,6 +412,34 @@ class TargetViewTemporalVGGT(nn.Module):
         patches = patches + self.ray_mlp(ray_feat)
         return torch.cat([special, patches], dim=2)
 
+    def _token_positions(
+        self,
+        batch_size: int,
+        num_views: int,
+        num_patch_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if num_patch_tokens != self.num_patch_tokens:
+            side = int(math.sqrt(num_patch_tokens))
+            if side * side != num_patch_tokens:
+                raise ValueError(
+                    f"Cannot build square token positions for {num_patch_tokens} patch tokens."
+                )
+            patch_h = patch_w = side
+        else:
+            patch_h, patch_w = self.patch_h, self.patch_w
+
+        patch_pos = self.position_getter(batch_size * num_views, patch_h, patch_w, device)
+        patch_pos = patch_pos + 1
+        special_pos = torch.zeros(
+            batch_size * num_views,
+            self.patch_start_idx,
+            2,
+            device=device,
+            dtype=patch_pos.dtype,
+        )
+        return torch.cat([special_pos, patch_pos], dim=1)
+
     def forward(self, batch: Dict) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
 
@@ -456,7 +490,10 @@ class TargetViewTemporalVGGT(nn.Module):
         time_t1 = self._time_offset(date_t1, date_t2, rel_gap)
         time_t3 = self._time_offset(date_t3, date_t2, rel_gap)
         time_t2 = self._time_offset(date_t2, date_t2, rel_gap)
-        pos_t2 = self.position_getter(batch_size, num_t2, num_tokens, device)
+        if self.self_attention_scope == "per_view":
+            pos_t2 = self._token_positions(batch_size, num_t2, num_patch_tokens, device)
+        else:
+            pos_t2 = self.position_getter(batch_size, num_t2, num_tokens, device)
 
         pred_cached_layers: List[torch.Tensor] = []
         for layer_idx in range(len(self.cache_layers)):
@@ -481,16 +518,25 @@ class TargetViewTemporalVGGT(nn.Module):
                 batch_size, num_t2, num_tokens, self.d_model
             )
             target_query = self._add_ray_embedding(target_query + time_t2, ray_t2)
-            query = target_query.reshape(batch_size, num_t2 * num_tokens, self.d_model)
+            if self.self_attention_scope == "per_view":
+                query = target_query.reshape(batch_size * num_t2, num_tokens, self.d_model)
+                memory_for_decoder = memory[:, None].expand(
+                    batch_size, num_t2, memory.shape[1], self.d_model
+                ).reshape(batch_size * num_t2, memory.shape[1], self.d_model)
+            else:
+                query = target_query.reshape(batch_size, num_t2 * num_tokens, self.d_model)
+                memory_for_decoder = memory
             del target_query
 
             hidden = query
             for block in self.decoder_blocks:
                 if self.use_gradient_checkpoint and self.training:
-                    hidden = grad_checkpoint(block, hidden, memory, pos_t2, use_reentrant=False)
+                    hidden = grad_checkpoint(
+                        block, hidden, memory_for_decoder, pos_t2, use_reentrant=False
+                    )
                 else:
-                    hidden = block(hidden, memory, pos_t2)
-            del memory
+                    hidden = block(hidden, memory_for_decoder, pos_t2)
+            del memory, memory_for_decoder
 
             hidden = hidden.reshape(batch_size, num_t2, num_tokens, self.d_model)
             pred = self.up_projs[layer_idx](self.up_norms[layer_idx](hidden))
