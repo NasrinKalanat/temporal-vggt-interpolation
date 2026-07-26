@@ -2,6 +2,12 @@
 #
 # Predicts target-view t2 depth from t1/t3 depth maps, then unprojects depth
 # to geometry only during evaluation/export.
+#
+# Single GPU:
+#   python src/trpm/trdm_train.py --config configs/train_trdm.yaml
+#
+# Multi GPU:
+#   torchrun --nproc_per_node=8 src/trpm/trdm_train.py --config configs/train_trdm.yaml
 
 model_class: trpm.trdm_model.TRDM
 
@@ -23,7 +29,7 @@ device: cuda:0
 image_preprocess_mode: pad
 
 epochs: 100
-batch_size: 8
+batch_size: 8  # per GPU when launched with torchrun
 num_workers: 4
 val_every: 1
 grad_clip: 1.0

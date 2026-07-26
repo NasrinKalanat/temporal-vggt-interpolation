@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Subset
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
 
 import sys
@@ -56,7 +59,55 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+LOSS_METRIC_KEYS = [
+    "loss",
+    "loss_log_depth",
+    "loss_depth_gradient",
+    "loss_depth_chamfer",
+    "loss_residual",
+    "loss_gate",
+    "valid_ratio",
+    "warp_valid_ratio",
+    "mean_gate",
+    "mean_abs_delta_logD",
+    "mean_D2_hat",
+    "mean_D2",
+]
+
+
+def is_distributed() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def setup_distributed() -> tuple[int, int, int]:
+    if not is_distributed():
+        return 0, 0, 1
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend)
+    return local_rank, rank, world_size
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
 def log(message: str) -> None:
+    if not is_main_process():
+        return
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
@@ -97,7 +148,9 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
-def choose_device(device: str) -> str:
+def choose_device(device: str, local_rank: int = 0) -> str:
+    if is_distributed():
+        return f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     if device != "auto":
         return device
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -137,6 +190,25 @@ def aggregate_metrics(total: dict[str, float], count: int) -> dict[str, float]:
     return {key: value / max(count, 1) for key, value in total.items()}
 
 
+def reduce_metrics(total: dict[str, float], count: int, device: str) -> dict[str, float]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return aggregate_metrics(total, count)
+    keys = LOSS_METRIC_KEYS
+    values = [total.get(key, 0.0) for key in keys] + [float(count)]
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    reduced_count = max(float(tensor[-1].item()), 1.0)
+    return {key: float(tensor[idx].item() / reduced_count) for idx, key in enumerate(keys)}
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def should_show_progress() -> bool:
+    return is_main_process()
+
+
 def train_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -148,7 +220,7 @@ def train_epoch(
     model.train()
     totals: dict[str, float] = {}
     count = 0
-    for batch in tqdm(loader, desc="train", leave=False):
+    for batch in tqdm(loader, desc="train", leave=False, disable=not should_show_progress()):
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         outputs = model(batch)
@@ -160,7 +232,7 @@ def train_epoch(
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach())
         count += 1
-    return aggregate_metrics(totals, count)
+    return reduce_metrics(totals, count, device)
 
 
 @torch.no_grad()
@@ -173,14 +245,14 @@ def eval_epoch(
     model.eval()
     totals: dict[str, float] = {}
     count = 0
-    for batch in tqdm(loader, desc="val", leave=False):
+    for batch in tqdm(loader, desc="val", leave=False, disable=not should_show_progress()):
         batch = move_batch(batch, device)
         outputs = model(batch)
         losses = trdm_loss(outputs, batch, loss_cfg)
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach())
         count += 1
-    return aggregate_metrics(totals, count)
+    return reduce_metrics(totals, count, device)
 
 
 def train_fold(
@@ -189,8 +261,12 @@ def train_fold(
     cfg: dict[str, Any],
     device: str,
     output_dir: Path,
+    distributed: bool = False,
 ) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
     train_idx, val_idx = fold_indices(fold, dataset)
     if not train_idx:
         log(f"skip {fold['fold_id']}: no train samples")
@@ -199,7 +275,12 @@ def train_fold(
 
     model_cls = load_model_class(cfg["model_class"])
     model = model_cls(**cfg.get("model_kwargs", {})).to(device)
-    log(f"params={sum(param.numel() for param in model.parameters()):,}")
+    if distributed:
+        ddp_kwargs = {}
+        if device.startswith("cuda"):
+            ddp_kwargs = {"device_ids": [torch.device(device).index], "output_device": torch.device(device).index}
+        model = DDP(model, **ddp_kwargs)
+    log(f"params={sum(param.numel() for param in unwrap_model(model).parameters()):,}")
 
     opt_cfg = cfg.get("optimizer", {})
     optimizer = torch.optim.AdamW(
@@ -209,18 +290,26 @@ def train_fold(
         betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
     )
 
+    train_subset = Subset(dataset, train_idx)
+    rank = get_rank()
+    world_size = dist.get_world_size() if distributed else 1
+    val_rank_idx = val_idx[rank::world_size] if distributed else val_idx
+    val_subset = Subset(dataset, val_rank_idx) if val_idx else None
+    train_sampler = DistributedSampler(train_subset, shuffle=True) if distributed else None
+
     loader_kwargs = {
         "batch_size": cfg.get("batch_size", 8),
         "num_workers": cfg.get("num_workers", 4),
-        "shuffle": True,
+        "shuffle": train_sampler is None,
+        "sampler": train_sampler,
         "collate_fn": trdm_collate,
         "pin_memory": device.startswith("cuda"),
     }
-    train_loader = DataLoader(Subset(dataset, train_idx), **loader_kwargs)
+    train_loader = DataLoader(train_subset, **loader_kwargs)
     val_loader = None
-    if val_idx:
+    if val_subset is not None:
         val_loader = DataLoader(
-            Subset(dataset, val_idx),
+            val_subset,
             batch_size=cfg.get("batch_size", 8),
             num_workers=cfg.get("num_workers", 4),
             shuffle=False,
@@ -244,6 +333,8 @@ def train_fold(
     stale_epochs = 0
 
     for epoch in range(1, total_epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         lr = cosine_lr(epoch - 1, warmup, total_epochs, base_lr, min_lr)
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -265,7 +356,8 @@ def train_fold(
                 best_val = val_loss
                 best_epoch = epoch
                 stale_epochs = 0
-                torch.save(model.state_dict(), output_dir / "best_model.pt")
+                if is_main_process():
+                    torch.save(unwrap_model(model).state_dict(), output_dir / "best_model.pt")
             else:
                 stale_epochs += 1
             log(
@@ -279,6 +371,8 @@ def train_fold(
             )
             if patience and stale_epochs >= patience:
                 log(f"early stopping after {stale_epochs} stale validation checks")
+                if distributed:
+                    dist.barrier()
                 break
         else:
             log(
@@ -288,43 +382,54 @@ def train_fold(
                 f"warp={train_metrics.get('warp_valid_ratio', 0):.3f}"
             )
         history.append(row)
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_loss": best_val,
-                "best_epoch": best_epoch,
-                "history": history,
-            },
-            output_dir / "last_checkpoint.pt",
-        )
-    if best_epoch == 0:
-        torch.save(model.state_dict(), output_dir / "best_model.pt")
-    write_json(output_dir / "training_history.json", history)
+        if is_main_process():
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": unwrap_model(model).state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_val_loss": best_val,
+                    "best_epoch": best_epoch,
+                    "history": history,
+                },
+                output_dir / "last_checkpoint.pt",
+            )
+    if is_main_process():
+        if best_epoch == 0:
+            torch.save(unwrap_model(model).state_dict(), output_dir / "best_model.pt")
+        write_json(output_dir / "training_history.json", history)
+    if distributed:
+        dist.barrier()
 
 
 def main() -> None:
     args = parse_args()
     cfg = build_config(args)
-    torch.manual_seed(cfg.get("seed", 42))
-    device = choose_device(cfg.get("device", "auto"))
-    cfg["output_root"].mkdir(parents=True, exist_ok=True)
-    write_json(cfg["output_root"] / "train_config.json", cfg)
-    dataset = TRDMDepthDataset(
-        cfg["vggt_output_root"],
-        preprocess_mode=cfg.get("image_preprocess_mode", "pad"),
-    )
-    log(f"dataset samples={len(dataset)} root={cfg['vggt_output_root']}")
-    triplets = load_triplets(cfg["triplets_path"])
-    for protocol in cfg["protocols"]:
-        for crop in cfg["crops"]:
-            folds = build_loto_folds(triplets, crop, protocol, cfg.get("val_date"))
-            for fold in folds:
-                if cfg.get("test_date") and fold["test_date"] != cfg["test_date"]:
-                    continue
-                fold_dir = cfg["output_root"] / protocol / fold["fold_id"]
-                train_fold(fold, dataset, cfg, device, fold_dir)
+    local_rank, rank, world_size = setup_distributed()
+    try:
+        torch.manual_seed(cfg.get("seed", 42) + rank)
+        device = choose_device(cfg.get("device", "auto"), local_rank)
+        if is_main_process():
+            cfg["output_root"].mkdir(parents=True, exist_ok=True)
+            write_json(cfg["output_root"] / "train_config.json", cfg)
+        if is_distributed():
+            dist.barrier()
+        dataset = TRDMDepthDataset(
+            cfg["vggt_output_root"],
+            preprocess_mode=cfg.get("image_preprocess_mode", "pad"),
+        )
+        log(f"dataset samples={len(dataset)} root={cfg['vggt_output_root']} world_size={world_size}")
+        triplets = load_triplets(cfg["triplets_path"])
+        for protocol in cfg["protocols"]:
+            for crop in cfg["crops"]:
+                folds = build_loto_folds(triplets, crop, protocol, cfg.get("val_date"))
+                for fold in folds:
+                    if cfg.get("test_date") and fold["test_date"] != cfg["test_date"]:
+                        continue
+                    fold_dir = cfg["output_root"] / protocol / fold["fold_id"]
+                    train_fold(fold, dataset, cfg, device, fold_dir, distributed=is_distributed())
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
