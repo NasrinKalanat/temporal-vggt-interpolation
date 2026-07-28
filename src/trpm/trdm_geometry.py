@@ -193,8 +193,8 @@ def warp_depth_to_target(
         if not valid.any():
             continue
         target_idx = (v[batch_idx][valid] * width + u[batch_idx][valid]).reshape(-1)
-        z_values = Z[batch_idx][valid].reshape(-1)
-        conf_values = confidence[batch_idx, 0][valid].reshape(-1)
+        z_values = Z[batch_idx][valid].reshape(-1).to(dtype)
+        conf_values = confidence[batch_idx, 0][valid].reshape(-1).to(dtype)
         z_buffer = torch.full((flat_size,), inf, device=device, dtype=dtype)
         z_buffer.scatter_reduce_(0, target_idx, z_values, reduce="amin", include_self=True)
         selected = z_values <= z_buffer[target_idx] + eps
