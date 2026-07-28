@@ -77,12 +77,14 @@ test_date: "20230831"
 device: cuda:0
 
 epochs: 100
-batch_size: 8
+batch_size: 4
 num_workers: 4
+amp: true
+amp_dtype: bfloat16
 ```
 
 When using distributed training, `batch_size` is per GPU. For example, with
-8 GPUs and `batch_size: 8`, the effective global batch size is `64`.
+8 GPUs and `batch_size: 4`, the effective global batch size is `32`.
 
 ## Single-GPU Training
 
@@ -119,6 +121,35 @@ In distributed mode:
 - Validation samples are split across ranks.
 - Loss metrics are reduced across all GPUs.
 - Only rank 0 writes checkpoints and logs.
+
+## Speed Notes
+
+TRDM is heavier than point-map TRPM because it performs camera-aware depth warps
+and target-view depth supervision. The fast training defaults are:
+
+```yaml
+batch_size: 4
+amp: true
+amp_dtype: bfloat16
+
+loss:
+  depth_chamfer_weight: 0.0
+  chamfer_num_points: 1024
+
+model_kwargs:
+  t3_context_samples: 1024
+```
+
+The expensive parts are:
+
+- t1-to-t2 depth warping with z-buffer splatting
+- t3 depth-context sampling
+- depth Chamfer loss
+
+The implementation samples t3 pixels before unprojection, so it avoids
+unprojecting every pixel in every t3 view. Keep `depth_chamfer_weight: 0.0` for
+the main run; if needed, enable it for a short fine-tune after the log-depth and
+gradient losses have converged.
 
 ## Outputs
 
@@ -243,9 +274,9 @@ match the data you generated.
 Reduce one or more of:
 
 ```yaml
-batch_size: 4
+batch_size: 2
 model_kwargs:
-  t3_context_samples: 2048
+  t3_context_samples: 512
   base_channels: 24
 ```
 
@@ -286,4 +317,3 @@ z = depth
 ```
 
 and camera-to-world matrices `T_c2w`.
-

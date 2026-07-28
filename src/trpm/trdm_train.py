@@ -39,6 +39,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "num_workers": 4,
     "val_every": 1,
     "device": "auto",
+    "amp": True,
+    "amp_dtype": "bfloat16",
     "grad_clip": 1.0,
     "image_preprocess_mode": "pad",
     "model_kwargs": {},
@@ -209,6 +211,24 @@ def should_show_progress() -> bool:
     return is_main_process()
 
 
+def amp_dtype_from_config(cfg: dict[str, Any]) -> torch.dtype:
+    dtype_name = str(cfg.get("amp_dtype", "bfloat16")).lower()
+    if dtype_name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if dtype_name in {"fp16", "float16"}:
+        return torch.float16
+    return torch.float32
+
+
+def amp_enabled(cfg: dict[str, Any], device: str) -> bool:
+    if not cfg.get("amp", True) or not device.startswith("cuda"):
+        return False
+    dtype = amp_dtype_from_config(cfg)
+    if dtype == torch.bfloat16:
+        return torch.cuda.is_bf16_supported()
+    return dtype == torch.float16
+
+
 def train_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -216,6 +236,8 @@ def train_epoch(
     device: str,
     loss_cfg: dict[str, Any],
     grad_clip: float,
+    amp_on: bool,
+    amp_dtype: torch.dtype,
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
@@ -223,8 +245,9 @@ def train_epoch(
     for batch in tqdm(loader, desc="train", leave=False, disable=not should_show_progress()):
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(batch)
-        losses = trdm_loss(outputs, batch, loss_cfg)
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+            outputs = model(batch)
+            losses = trdm_loss(outputs, batch, loss_cfg)
         losses["loss"].backward()
         if grad_clip and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -241,14 +264,17 @@ def eval_epoch(
     loader: DataLoader,
     device: str,
     loss_cfg: dict[str, Any],
+    amp_on: bool,
+    amp_dtype: torch.dtype,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {}
     count = 0
     for batch in tqdm(loader, desc="val", leave=False, disable=not should_show_progress()):
         batch = move_batch(batch, device)
-        outputs = model(batch)
-        losses = trdm_loss(outputs, batch, loss_cfg)
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+            outputs = model(batch)
+            losses = trdm_loss(outputs, batch, loss_cfg)
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach())
         count += 1
@@ -324,6 +350,9 @@ def train_fold(
     base_lr = opt_cfg.get("lr", 2e-4)
     loss_cfg = dict(cfg.get("loss", {}))
     loss_cfg.setdefault("conf_threshold", cfg.get("conf_threshold", 0.02))
+    amp_dtype = amp_dtype_from_config(cfg)
+    amp_on = amp_enabled(cfg, device)
+    log(f"amp={amp_on} dtype={amp_dtype}")
     best_val = float("inf")
     best_epoch = 0
     history = []
@@ -345,10 +374,12 @@ def train_fold(
             device,
             loss_cfg,
             cfg.get("grad_clip", 1.0),
+            amp_on,
+            amp_dtype,
         )
         row = {"epoch": epoch, "lr": lr, **{f"train_{k}": v for k, v in train_metrics.items()}}
         if val_loader is not None and epoch % cfg.get("val_every", 1) == 0:
-            val_metrics = eval_epoch(model, val_loader, device, loss_cfg)
+            val_metrics = eval_epoch(model, val_loader, device, loss_cfg, amp_on, amp_dtype)
             row.update({f"val_{key}": value for key, value in val_metrics.items()})
             val_loss = val_metrics.get("loss", float("inf"))
             improved = val_loss < best_val - min_delta

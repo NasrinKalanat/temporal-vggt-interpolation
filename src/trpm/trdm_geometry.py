@@ -218,59 +218,98 @@ def sample_t3_depth_context(
     conf_threshold: float = 0.02,
     eps: float = 1e-4,
 ) -> torch.Tensor:
-    """Sample t3 depth context features [B, K, 13] in target t2 camera frame."""
+    """Sample t3 depth context features [B, K, 13] in target t2 camera frame.
+
+    This samples valid pixels first, then unprojects only the sampled pixels.
+    The original dense implementation unprojected every pixel of every t3 view
+    for every batch item, which is prohibitively expensive at VGGT resolution.
+    """
     batch_size, num_views, _, height, width = D3.shape
     device = D3.device
     dtype = D3.dtype
     T2_w2c = torch.linalg.inv(T2_c2w)
     all_features: list[torch.Tensor] = []
-
-    uv = build_xy_grid(1, height, width, device).view(2, -1).T.to(dtype)
+    samples_per_view = max(1, (num_samples + num_views - 1) // num_views)
+    denom_w = max(width - 1, 1)
+    denom_h = max(height - 1, 1)
     for batch_idx in range(batch_size):
         features_per_batch = []
         R2 = T2_c2w[batch_idx, :3, :3]
         c2 = T2_c2w[batch_idx, :3, 3]
         for view_idx in range(num_views):
-            depth_view = D3[batch_idx : batch_idx + 1, view_idx]
-            conf_view = C3[batch_idx : batch_idx + 1, view_idx]
-            K_view = K3[batch_idx : batch_idx + 1, view_idx]
-            T3_view = T3_c2w[batch_idx : batch_idx + 1, view_idx]
-            pts_cam3 = unproject_depth(depth_view, K_view)
-            pts_world = transform_points(pts_cam3, T3_view[:, None, None])
-            pts_cam2 = transform_points(pts_world, T2_w2c[batch_idx : batch_idx + 1, None, None])
-
-            rays_src = build_ray_map(K_view, height, width).view(1, 3, -1)
-            R3 = T3_view[0, :3, :3]
-            R_rel = R2.T @ R3
-            rays_tgt = (R_rel @ rays_src[0]).T
-            rays_tgt = F.normalize(rays_tgt, dim=-1)
-
-            c3 = T3_view[0, :3, 3]
-            c3_tgt = (R2.T @ (c3 - c2)).view(1, 3).expand(height * width, 3)
-            xyz = pts_cam2.view(-1, 3)
-            depth_flat = depth_view.view(-1, 1)
-            conf_flat = conf_view.view(-1, 1)
+            depth_flat = D3[batch_idx, view_idx, 0].reshape(-1)
+            conf_flat = C3[batch_idx, view_idx, 0].reshape(-1)
             valid = (
-                torch.isfinite(xyz).all(dim=1)
-                & torch.isfinite(depth_flat[:, 0])
-                & (depth_flat[:, 0] > eps)
-                & torch.isfinite(conf_flat[:, 0])
-                & (conf_flat[:, 0] > conf_threshold)
-                & (xyz[:, 2] > eps)
+                torch.isfinite(depth_flat)
+                & torch.isfinite(conf_flat)
+                & (depth_flat > eps)
+                & (conf_flat > conf_threshold)
             )
-            if valid.any():
-                features = torch.cat(
-                    [
-                        xyz[valid],
-                        depth_flat[valid],
-                        conf_flat[valid],
-                        uv[valid],
-                        rays_tgt[valid],
-                        c3_tgt[valid],
-                    ],
-                    dim=-1,
-                )
-                features_per_batch.append(features)
+            valid_idx = valid.nonzero(as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                continue
+
+            if valid_idx.numel() >= samples_per_view:
+                chosen = valid_idx[torch.randperm(valid_idx.numel(), device=device)[:samples_per_view]]
+            else:
+                chosen = valid_idx[torch.randint(valid_idx.numel(), (samples_per_view,), device=device)]
+
+            pixel_v = torch.div(chosen, width, rounding_mode="floor").to(dtype)
+            pixel_u = (chosen % width).to(dtype)
+            depth_values = depth_flat[chosen]
+            conf_values = conf_flat[chosen]
+            K_view = K3[batch_idx, view_idx]
+            fx = K_view[0, 0].clamp_min(1e-6)
+            fy = K_view[1, 1].clamp_min(1e-6)
+            cx = K_view[0, 2]
+            cy = K_view[1, 2]
+
+            x_cam3 = (pixel_u - cx) / fx * depth_values
+            y_cam3 = (pixel_v - cy) / fy * depth_values
+            pts_cam3 = torch.stack([x_cam3, y_cam3, depth_values], dim=-1)
+
+            T3_view = T3_c2w[batch_idx, view_idx]
+            R3 = T3_view[:3, :3]
+            c3 = T3_view[:3, 3]
+            pts_world = pts_cam3 @ R3.transpose(0, 1) + c3
+
+            T2_w2c_view = T2_w2c[batch_idx]
+            pts_cam2 = pts_world @ T2_w2c_view[:3, :3].transpose(0, 1) + T2_w2c_view[:3, 3]
+            z_valid = torch.isfinite(pts_cam2).all(dim=1) & (pts_cam2[:, 2] > eps)
+            if not z_valid.any():
+                continue
+
+            ray_src = torch.stack(
+                [
+                    (pixel_u - cx) / fx,
+                    (pixel_v - cy) / fy,
+                    torch.ones_like(pixel_u),
+                ],
+                dim=-1,
+            )
+            ray_src = F.normalize(ray_src, dim=-1)
+            R_rel = R2.transpose(0, 1) @ R3
+            ray_tgt = F.normalize(ray_src @ R_rel.transpose(0, 1), dim=-1)
+            uv = torch.stack(
+                [
+                    2.0 * pixel_u / denom_w - 1.0,
+                    2.0 * pixel_v / denom_h - 1.0,
+                ],
+                dim=-1,
+            )
+            c3_tgt = (R2.transpose(0, 1) @ (c3 - c2)).view(1, 3).expand(chosen.numel(), 3)
+            features = torch.cat(
+                [
+                    pts_cam2,
+                    depth_values[:, None],
+                    conf_values[:, None],
+                    uv,
+                    ray_tgt,
+                    c3_tgt,
+                ],
+                dim=-1,
+            )
+            features_per_batch.append(features[z_valid])
 
         if features_per_batch:
             features_all = torch.cat(features_per_batch, dim=0)

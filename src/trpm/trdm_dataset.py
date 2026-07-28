@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -62,9 +63,24 @@ def _load_depth_and_conf(date_dir: Path) -> tuple[np.ndarray, np.ndarray]:
     return depth, conf
 
 
+@lru_cache(maxsize=24)
+def _load_depth_and_conf_cached(date_dir: str) -> tuple[np.ndarray, np.ndarray]:
+    return _load_depth_and_conf(Path(date_dir))
+
+
 def _load_c2w_stack(date_dir: Path) -> np.ndarray:
     extrinsics = np.load(date_dir / "predictions" / "extrinsic.npy").astype(np.float32)
     return np.stack([vggt_extrinsic_to_c2w_np(ext) for ext in extrinsics]).astype(np.float32)
+
+
+@lru_cache(maxsize=24)
+def _load_c2w_stack_cached(date_dir: str) -> np.ndarray:
+    return _load_c2w_stack(Path(date_dir))
+
+
+@lru_cache(maxsize=24)
+def _load_intrinsics_cached(date_dir: str, height: int, width: int, preprocess_mode: str) -> np.ndarray:
+    return load_intrinsics(Path(date_dir), height, width, preprocess_mode)
 
 
 class TRDMDepthDataset(Dataset):
@@ -140,17 +156,20 @@ class TRDMDepthDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         entry = self.index[idx]
         view_idx = entry["view_idx"]
-        D1_all, C1_all = _load_depth_and_conf(entry["t1_dir"])
-        D2_all, C2_all = _load_depth_and_conf(entry["t2_dir"])
-        D3_all, C3_all = _load_depth_and_conf(entry["t3_dir"])
+        t1_dir = str(entry["t1_dir"])
+        t2_dir = str(entry["t2_dir"])
+        t3_dir = str(entry["t3_dir"])
+        D1_all, C1_all = _load_depth_and_conf_cached(t1_dir)
+        D2_all, C2_all = _load_depth_and_conf_cached(t2_dir)
+        D3_all, C3_all = _load_depth_and_conf_cached(t3_dir)
         height, width = D1_all.shape[1], D1_all.shape[2]
 
-        K1_all = load_intrinsics(entry["t1_dir"], height, width, self.preprocess_mode)
-        K2_all = load_intrinsics(entry["t2_dir"], height, width, self.preprocess_mode)
-        K3_all = load_intrinsics(entry["t3_dir"], height, width, self.preprocess_mode)
-        T1_all = _load_c2w_stack(entry["t1_dir"])
-        T2_all = _load_c2w_stack(entry["t2_dir"])
-        T3_all = _load_c2w_stack(entry["t3_dir"])
+        K1_all = _load_intrinsics_cached(t1_dir, height, width, self.preprocess_mode)
+        K2_all = _load_intrinsics_cached(t2_dir, height, width, self.preprocess_mode)
+        K3_all = _load_intrinsics_cached(t3_dir, height, width, self.preprocess_mode)
+        T1_all = _load_c2w_stack_cached(t1_dir)
+        T2_all = _load_c2w_stack_cached(t2_dir)
+        T3_all = _load_c2w_stack_cached(t3_dir)
 
         sample: dict[str, Any] = {
             "D1": torch.from_numpy(D1_all[view_idx]).unsqueeze(0),

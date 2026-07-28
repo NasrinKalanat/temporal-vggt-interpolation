@@ -11,9 +11,9 @@
 
 model_class: trpm.trdm_model.TRDM
 
-vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+vggt_output_root: vggt_outputs/non_view_consistent_v16_o4_depth
 triplets_path: prepared_data/subsets/benchmark_triplets.json
-output_root: runs/trdm_t1t2_paired_v16_o8
+output_root: runs/trdm_non_view_consistent_v16_o4
 
 protocols:
   - strict
@@ -29,9 +29,11 @@ device: cuda:0
 image_preprocess_mode: pad
 
 epochs: 100
-batch_size: 8  # per GPU when launched with torchrun
+batch_size: 4  # per GPU when launched with torchrun
 num_workers: 4
 val_every: 1
+amp: true
+amp_dtype: bfloat16
 grad_clip: 1.0
 
 optimizer:
@@ -50,12 +52,14 @@ early_stopping:
 loss:
   log_depth_weight: 1.0
   depth_gradient_weight: 0.2
-  depth_chamfer_weight: 0.01
+  # Chamfer is expensive; keep it off for fast training, then enable at 0.005
+  # for a short fine-tune if needed.
+  depth_chamfer_weight: 0.0
   residual_weight: 0.01
   gate_weight: 0.001
   conf_threshold: 0.02
   depth_smooth_l1_beta: 0.05
-  chamfer_num_points: 4096
+  chamfer_num_points: 1024
   eps: 1.0e-4
 
 model_kwargs:
@@ -65,6 +69,6 @@ model_kwargs:
   pose_dim: 128
   time_dim: 128
   cond_dim: 256
-  t3_context_samples: 4096
+  t3_context_samples: 1024
   conf_threshold: 0.02
   eps: 1.0e-4
