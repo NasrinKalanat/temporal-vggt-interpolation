@@ -1,0 +1,97 @@
+# Temporal Residual Endpoint Direct-Branch Ablation - Frozen Point Head
+#
+# Same training setup as train_residual_endpoint_adaln_freezed_head.yaml.
+# Difference in the model update rule:
+#
+#   baseline:      updated = f1 + gate * up_proj(norm(h - q))
+#   direct_branch: updated = f1 + gate * up_proj(norm(h))
+#
+# This variant also uses one temporal transformer stack per VGGT cache layer.
+
+triplets_path: prepared_data/subsets/benchmark_triplets.json
+vggt_output_root: vggt_outputs/t1t2_paired_v16_o8
+output_root: runs/residual_endpoint_t1t2_paired_v16_o8_adaln_1layer_freezed_head_cam_direct_branch_per_layer
+
+vggt_inference_mode: precomputed
+
+protocols:
+  - strict
+
+crops:
+  - corn
+
+test_date: "20230831"
+
+seed: 42
+image_preprocess_mode: pad
+conf_threshold: 0.02
+feature_cache_root: /home/ec2-user/workspace/canopy-org/vggt_cache
+
+freeze_point_head: true
+
+epochs: 50
+resume: false
+batch_size: 1
+num_workers: 2
+val_every: 1
+device: cuda:0
+grad_clip: 1.0
+
+early_stopping:
+  patience: 10
+  min_delta: 1.0e-4
+
+optimizer:
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+loss:
+  pointmap_weight: 0.0
+
+  cache_weight: 1.0
+  cache_smooth_l1_beta: 0.1
+  cache_cos_weight: 0.1
+  cache_normalize: true
+  cache_patch_only: true
+
+  delta_reg_weight: 0
+  gate_reg_weight: 0
+
+teacher:
+  conf_mask_threshold: 0.02
+  conf_threshold_type: absolute
+  use_weighted_reg_loss: false
+  weight_clip_min: 0.25
+  weight_clip_max: 4.0
+
+model_module: models.temporal_vggt_residual_endpoint_direct_branch
+model_class: TemporalResidualEndpointDirectBranch
+model_kwargs:
+  vggt_model_id: facebook/VGGT-1B
+  embed_dim: 1024
+  num_query_views: 16
+
+  num_transformer_layers: 1
+  num_transformer_heads: 8
+  mlp_ratio: 2.0
+  dropout: 0.1
+  d_model_down_proj: 512
+
+  time_conditioning_mode: residual_adaln
+  time_hidden_dim: 256
+
+  use_camera_cond: true
+  camera_hidden_dim: 256
+
+  use_rope_in_self_attention: true
+
+  init_point_head_from_vggt: true
+  cache_layers: [4, 11, 17, 23]
+  point_head_mode: full
+
+  use_gradient_checkpoint: false
