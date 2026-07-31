@@ -28,6 +28,10 @@ eval_alpha: 0.5
 eval_beta: 0.5
 save_clouds: true
 baselines_only: false
+eval_batch_size: 4
+compute_normals: false
+shard_wait_poll_s: 10
+shard_wait_timeout_s: 3600
 
 model_kwargs:
   input_channels: 9

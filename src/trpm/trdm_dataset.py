@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -91,10 +91,12 @@ class TRDMDepthDataset(Dataset):
         vggt_output_root: Path | str,
         preprocess_mode: str = "pad",
         require_dataset_cameras: bool = True,
+        triplet_ids: Iterable[str] | None = None,
     ):
         self.vggt_root = Path(vggt_output_root)
         self.preprocess_mode = preprocess_mode
         self.require_dataset_cameras = require_dataset_cameras
+        self.triplet_ids = set(triplet_ids) if triplet_ids is not None else None
         self.index = self._build_index()
 
     def _date_ready(self, date_dir: Path) -> bool:
@@ -117,6 +119,8 @@ class TRDMDepthDataset(Dataset):
                 continue
             parsed = parse_triplet_dir(triplet_dir.name)
             if parsed is None:
+                continue
+            if self.triplet_ids is not None and triplet_dir.name not in self.triplet_ids:
                 continue
             t1_date, t2_date, t3_date, crop = parsed
             time_feat = compute_time_feat(t1_date, t2_date, t3_date)

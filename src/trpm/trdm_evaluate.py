@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -65,12 +66,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "eval_beta": 0.5,
     "save_clouds": False,
     "baselines_only": False,
+    "eval_batch_size": 4,
+    "compute_normals": False,
+    "shard_wait_poll_s": 10,
+    "shard_wait_timeout_s": 3600,
     "model_kwargs": {},
 }
 
 
+def distributed_info() -> tuple[int, int, int]:
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, local_rank, world_size
+
+
 def log(message: str) -> None:
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+    rank, _, world_size = distributed_info()
+    prefix = f"[rank {rank}/{world_size}] " if world_size > 1 else ""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {prefix}{message}", flush=True)
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
@@ -189,19 +203,29 @@ def _load_c2w(date_dir: Path) -> np.ndarray:
     return np.stack([vggt_extrinsic_to_c2w_np(ext) for ext in extrinsics]).astype(np.float32)
 
 
-def _depth_view_cloud(
-    date_dir: Path,
-    view_idx: int,
+@lru_cache(maxsize=96)
+def _load_date_bundle_cached(
+    date_dir_str: str,
     preprocess_mode: str,
-    conf_threshold: float,
-    align_to_gps: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Any]:
+    date_dir = Path(date_dir_str)
     depth_all, conf_all = _load_depth_and_conf(date_dir)
     height, width = depth_all.shape[1], depth_all.shape[2]
     K_all = load_intrinsics(date_dir, height, width, preprocess_mode)
     T_all = _load_c2w(date_dir)
-    alignment = gps_alignment(date_dir) if align_to_gps else None
+    alignment = gps_alignment(date_dir)
+    return depth_all, conf_all, K_all, T_all, alignment
 
+
+def _depth_view_cloud_from_bundle(
+    depth_all: np.ndarray,
+    conf_all: np.ndarray,
+    K_all: np.ndarray,
+    T_all: np.ndarray,
+    alignment: Any,
+    view_idx: int,
+    conf_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
     depth = depth_all[view_idx]
     confidence = conf_all[view_idx]
     points = unproject_depth_numpy(depth, K_all[view_idx], T_all[view_idx])
@@ -216,6 +240,23 @@ def _depth_view_cloud(
     return points[valid].astype(np.float32), confidence.reshape(-1)[valid].astype(np.float32)
 
 
+def _depth_view_cloud(
+    date_dir: Path,
+    view_idx: int,
+    preprocess_mode: str,
+    conf_threshold: float,
+    align_to_gps: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    depth_all, conf_all, K_all, T_all, alignment = _load_date_bundle_cached(
+        str(date_dir), preprocess_mode
+    )
+    if not align_to_gps:
+        alignment = None
+    return _depth_view_cloud_from_bundle(
+        depth_all, conf_all, K_all, T_all, alignment, view_idx, conf_threshold
+    )
+
+
 def _load_date_cloud(
     date_dir: Path,
     preprocess_mode: str,
@@ -224,12 +265,16 @@ def _load_date_cloud(
     seed: int,
     voxel_size: float = 0.02,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
-    depth_all, _ = _load_depth_and_conf(date_dir)
+    depth_all, conf_all, K_all, T_all, alignment = _load_date_bundle_cached(
+        str(date_dir), preprocess_mode
+    )
     views: list[np.ndarray] = []
     all_points: list[np.ndarray] = []
     all_confidence: list[np.ndarray] = []
     for view_idx in range(depth_all.shape[0]):
-        points, confidence = _depth_view_cloud(date_dir, view_idx, preprocess_mode, conf_threshold)
+        points, confidence = _depth_view_cloud_from_bundle(
+            depth_all, conf_all, K_all, T_all, alignment, view_idx, conf_threshold
+        )
         if len(points):
             views.append(np.concatenate([points, confidence[:, None]], axis=1))
             all_points.append(points)
@@ -293,6 +338,7 @@ def _metrics(
         voxel_size=cfg["voxel_size"],
         alpha=cfg["eval_alpha"],
         beta=cfg["eval_beta"],
+        compute_normals=bool(cfg.get("compute_normals", False)),
     )
 
 
@@ -348,32 +394,36 @@ def predict_variant_depth_clouds(
     seed = cfg.get("seed", 42)
     voxel_size = cfg.get("voxel_size", 0.05)
     pred_conf_threshold = cfg.get("pred_conf_threshold", 0.0)
+    batch_size = max(1, int(cfg.get("eval_batch_size", 1)))
 
-    for sample_idx in sample_indices:
-        sample = dataset[sample_idx]
-        batch = move_batch(trdm_collate([sample]), device)
+    for start in range(0, len(sample_indices), batch_size):
+        batch_indices = sample_indices[start : start + batch_size]
+        samples = [dataset[sample_idx] for sample_idx in batch_indices]
+        batch = move_batch(trdm_collate(samples), device)
         outputs = model(batch)
-        depth = outputs["D2_hat"][0, 0].float().cpu().numpy()
-        gate = outputs.get("G", outputs["gate"])[0, 0].float().cpu().numpy()
-        entry = dataset.index[sample_idx]
-        t2_dir = entry["t2_dir"]
-        view_idx = entry["view_idx"]
-        height, width = depth.shape
-        K_all = load_intrinsics(t2_dir, height, width, preprocess_mode)
-        T_all = _load_c2w(t2_dir)
-        points = unproject_depth_numpy(depth, K_all[view_idx], T_all[view_idx])
-        points = apply_similarity(points, gps_alignment(t2_dir))
-        confidence = np.ones((points.shape[0],), dtype=np.float32)
-        valid = np.isfinite(points).all(axis=1) & np.isfinite(depth.reshape(-1)) & (depth.reshape(-1) > 0)
-        if pred_conf_threshold > 0:
-            valid &= np.isfinite(gate.reshape(-1)) & (gate.reshape(-1) >= pred_conf_threshold)
-            confidence = gate.reshape(-1).astype(np.float32)
-        points = points[valid].astype(np.float32)
-        confidence = confidence[valid].astype(np.float32)
-        if len(points):
-            per_view_clouds.append(np.concatenate([points, confidence[:, None]], axis=1))
-            all_points.append(points)
-            all_confidence.append(confidence)
+        depths = outputs["D2_hat"][:, 0].float().cpu().numpy()
+        gates = outputs.get("G", outputs["gate"])[:, 0].float().cpu().numpy()
+
+        for batch_offset, sample_idx in enumerate(batch_indices):
+            depth = depths[batch_offset]
+            gate = gates[batch_offset]
+            entry = dataset.index[sample_idx]
+            t2_dir = entry["t2_dir"]
+            view_idx = entry["view_idx"]
+            _, _, K_all, T_all, alignment = _load_date_bundle_cached(str(t2_dir), preprocess_mode)
+            points = unproject_depth_numpy(depth, K_all[view_idx], T_all[view_idx])
+            points = apply_similarity(points, alignment)
+            confidence = np.ones((points.shape[0],), dtype=np.float32)
+            valid = np.isfinite(points).all(axis=1) & np.isfinite(depth.reshape(-1)) & (depth.reshape(-1) > 0)
+            if pred_conf_threshold > 0:
+                valid &= np.isfinite(gate.reshape(-1)) & (gate.reshape(-1) >= pred_conf_threshold)
+                confidence = gate.reshape(-1).astype(np.float32)
+            points = points[valid].astype(np.float32)
+            confidence = confidence[valid].astype(np.float32)
+            if len(points):
+                per_view_clouds.append(np.concatenate([points, confidence[:, None]], axis=1))
+                all_points.append(points)
+                all_confidence.append(confidence)
 
     if not all_points:
         empty = np.zeros((0, 3), dtype=np.float32)
@@ -386,7 +436,7 @@ def predict_variant_depth_clouds(
 
 def evaluate_variant(
     model: torch.nn.Module | None,
-    dataset: TRDMDepthDataset,
+    dataset: TRDMDepthDataset | None,
     sample_indices: list[int],
     triplet_id: str,
     variant: str,
@@ -435,7 +485,7 @@ def evaluate_variant(
             pred_view = apply_baseline(baseline, t1_view, ref_view, t3_view, tau, n_points, seed + view_idx)
             per_view[baseline].append(_metrics(pred_view, ref_view, cfg))
 
-    if model is not None and sample_indices:
+    if model is not None and dataset is not None and sample_indices:
         pred_points, pred_conf, pred_views = predict_variant_depth_clouds(
             model, dataset, sample_indices, device, cfg
         )
@@ -479,7 +529,7 @@ def evaluate_variant(
 def evaluate_fold(
     fold: dict[str, Any],
     model: torch.nn.Module | None,
-    dataset: TRDMDepthDataset,
+    dataset: TRDMDepthDataset | None,
     cfg: dict[str, Any],
     device: str,
     output_dir: Path,
@@ -489,16 +539,19 @@ def evaluate_fold(
     if clouds_dir is not None:
         clouds_dir.mkdir(parents=True, exist_ok=True)
 
-    lookup = _dataset_lookup(dataset)
+    lookup = _dataset_lookup(dataset) if dataset is not None else {}
     variant_rows: list[dict[str, Any]] = []
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank, local_rank, world_size = distributed_info()
     test_triplets = [
         triplet for idx, triplet in enumerate(fold["test_triplets"])
         if idx % world_size == rank
     ]
+    log(
+        f"fold={fold['fold_id']} assigned {len(test_triplets)}/"
+        f"{len(fold['test_triplets'])} triplets on local_rank={local_rank}"
+    )
 
-    for triplet in tqdm(test_triplets, desc=f"fold={fold['fold_id']} rank={rank}"):
+    for triplet in tqdm(test_triplets, desc=f"fold={fold['fold_id']} rank={rank}", position=local_rank):
         triplet_id = triplet_id_from_fold_entry(triplet)
         tau = float(triplet["tau"])
         for variant in _list_variants(cfg["vggt_output_root"], triplet_id):
@@ -554,6 +607,27 @@ def merge_fold_shards(fold: dict[str, Any], output_dir: Path, world_size: int, m
     return result
 
 
+def wait_for_fold_shards(output_dir: Path, world_size: int, cfg: dict[str, Any]) -> None:
+    expected = [output_dir / f"eval_result_rank{rank_idx:02d}.json" for rank_idx in range(world_size)]
+    poll_s = max(1.0, float(cfg.get("shard_wait_poll_s", 10)))
+    timeout_s = float(cfg.get("shard_wait_timeout_s", 3600))
+    deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+    last_log = 0.0
+    while True:
+        missing = [path.name for path in expected if not path.exists()]
+        if not missing:
+            return
+        now = time.monotonic()
+        if now - last_log >= poll_s:
+            log(f"waiting for fold shards in {output_dir}; missing={missing}")
+            last_log = now
+        if deadline is not None and now >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {len(missing)} fold shard(s) in {output_dir}: {missing}"
+            )
+        time.sleep(poll_s)
+
+
 def write_report(path: Path, results: list[dict[str, Any]]) -> None:
     metrics = ["asymmetric_chamfer", "f1", "precision", "recall", "voxel_iou", "height_median_error"]
     lines = ["# TRDM Evaluation Report", ""]
@@ -587,20 +661,13 @@ def load_checkpoint_model(checkpoint: Path, cfg: dict[str, Any], device: str) ->
 def main() -> None:
     args = parse_args()
     cfg = build_config(args)
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank, local_rank, world_size = distributed_info()
     if cfg["device"] == "auto" and torch.cuda.is_available() and world_size > 1:
-        device = f"cuda:{rank}"
+        device = f"cuda:{local_rank}"
     else:
         device = choose_device(cfg["device"])
     if device.startswith("cuda"):
         torch.cuda.set_device(torch.device(device).index or 0)
-
-    dataset = TRDMDepthDataset(
-        cfg["vggt_output_root"],
-        preprocess_mode=cfg.get("image_preprocess_mode", "pad"),
-    )
-    log(f"dataset samples={len(dataset)} root={cfg['vggt_output_root']} rank={rank}/{world_size}")
 
     cfg["output_root"].mkdir(parents=True, exist_ok=True)
     if rank == 0:
@@ -616,6 +683,32 @@ def main() -> None:
                 continue
             if fold["test_triplets"]:
                 fold_jobs.append(fold)
+
+    all_needed_triplet_ids = {
+        triplet_id_from_fold_entry(triplet)
+        for fold in fold_jobs
+        for triplet in fold["test_triplets"]
+    }
+    rank_needed_triplet_ids = {
+        triplet_id_from_fold_entry(triplet)
+        for fold in fold_jobs
+        for idx, triplet in enumerate(fold["test_triplets"])
+        if idx % world_size == rank
+    }
+    log(
+        f"startup: folds={len(fold_jobs)} test_triplets={len(all_needed_triplet_ids)} "
+        f"rank_triplets={len(rank_needed_triplet_ids)} device={device} root={cfg['vggt_output_root']}"
+    )
+
+    dataset: TRDMDepthDataset | None = None
+    if not cfg.get("baselines_only"):
+        log("indexing TRDM samples for selected folds")
+        dataset = TRDMDepthDataset(
+            cfg["vggt_output_root"],
+            preprocess_mode=cfg.get("image_preprocess_mode", "pad"),
+            triplet_ids=rank_needed_triplet_ids,
+        )
+        log(f"dataset samples={len(dataset)}")
 
     local_results = []
     methods = list(BASELINES) + ([] if cfg.get("baselines_only") else ["trdm"])
@@ -639,9 +732,7 @@ def main() -> None:
     if rank == 0:
         for fold in fold_jobs:
             output_dir = cfg["output_root"] / fold["protocol"] / fold["fold_id"]
-            expected = [output_dir / f"eval_result_rank{rank_idx:02d}.json" for rank_idx in range(world_size)]
-            while not all(path.exists() for path in expected):
-                time.sleep(5)
+            wait_for_fold_shards(output_dir, world_size, cfg)
             merge_fold_shards(fold, output_dir, world_size, methods)
         summary = []
         for fold in fold_jobs:

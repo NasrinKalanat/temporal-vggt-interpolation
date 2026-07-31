@@ -126,6 +126,7 @@ def compute_metrics(
     voxel_size: float = 0.05,
     alpha: float = 0.5,
     beta: float = 0.5,
+    compute_normals: bool = True,
 ) -> dict[str, float]:
     """Compute all evaluation metrics between predicted and ground-truth point clouds.
 
@@ -162,7 +163,7 @@ def compute_metrics(
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # Normal consistency: mean |n_pred · n_gt_matched|
-    if len(pred_points) >= 10 and len(gt_points) >= 10:
+    if compute_normals and len(pred_points) >= 10 and len(gt_points) >= 10:
         pred_normals = _estimate_normals(pred_points)
         gt_normals = _estimate_normals(gt_points)
         matched_gt_normals = gt_normals[pred_to_gt_idx]
@@ -198,4 +199,3 @@ def compute_metrics(
         pointmap_l1=nan,
         pointmap_l2=nan,
     )
-

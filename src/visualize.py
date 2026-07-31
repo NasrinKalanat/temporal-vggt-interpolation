@@ -41,14 +41,25 @@ def discover_eval_clouds(eval_root: Path) -> dict[str, dict]:
     """Scan eval_root for fold dirs that have saved clouds from --save-clouds.
 
     Returns {fold_id: {"clouds_dir": Path, "samples": [key, ...]}} where each
-    key is like '20230812_20230831_20230922_corn_views_00'.
+    key is like '20230812_20230831_20230922_corn_views_00' for the legacy
+    evaluator or 'triplet_id/variant' for TRDM.
     """
     folds: dict[str, dict] = {}
+    if not eval_root.exists():
+        return folds
     for clouds_dir in sorted(eval_root.rglob("clouds")):
         if not clouds_dir.is_dir():
             continue
-        fold_id = clouds_dir.parent.name
+        try:
+            fold_id = str(clouds_dir.parent.relative_to(eval_root))
+        except ValueError:
+            fold_id = clouds_dir.parent.name
         samples = sorted(f.stem[:-5] for f in clouds_dir.glob("*_pred.npy"))  # strip "_pred"
+        trdm_samples = sorted(
+            str(path.parent.relative_to(clouds_dir))
+            for path in clouds_dir.glob("*/*/trdm_pred_merged.npz")
+        )
+        samples.extend(trdm_samples)
         if samples:
             folds[fold_id] = {"clouds_dir": clouds_dir, "samples": samples}
     return folds
@@ -56,6 +67,9 @@ def discover_eval_clouds(eval_root: Path) -> dict[str, dict]:
 
 def _parse_sample_label(key: str) -> str:
     """'20230812_20230831_20230922_corn_views_00' → readable label."""
+    if "/" in key:
+        triplet_id, variant = key.split("/", 1)
+        return f"{_parse_sample_label(triplet_id)} · {variant}"
     parts = key.split("_")
     if len(parts) >= 5:
         t1, t2, t3, crop = parts[0], parts[1], parts[2], parts[3]
@@ -68,6 +82,20 @@ def _parse_sample_label(key: str) -> str:
 def eval_view_options(clouds_dir: Path, sample_key: str) -> list[dict[str, str]]:
     """Return merged plus saved per-view cloud choices for an eval sample."""
     options = [{"label": "Merged views", "value": "merged"}]
+    trdm_dir = clouds_dir / sample_key
+    if (trdm_dir / "trdm_pred_merged.npz").exists() and (trdm_dir / "t2_ref_merged.npz").exists():
+        pred_views = {
+            path.stem.removeprefix("trdm_pred_")
+            for path in trdm_dir.glob("trdm_pred_view_*.npz")
+        }
+        ref_views = {
+            path.stem.removeprefix("t2_ref_")
+            for path in trdm_dir.glob("t2_ref_view_*.npz")
+        }
+        view_keys = sorted(pred_views & ref_views)
+        options.extend({"label": key.replace("view_", "View "), "value": key} for key in view_keys)
+        return options
+
     pred_path = clouds_dir / f"{sample_key}_pred_views.npz"
     ref_path = clouds_dir / f"{sample_key}_ref_views.npz"
     if not pred_path.exists() or not ref_path.exists():
@@ -93,6 +121,20 @@ def load_eval_cloud_pair(
     view_key: str | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load merged eval clouds or one saved per-view pair."""
+    trdm_dir = clouds_dir / sample_key
+    if (trdm_dir / "trdm_pred_merged.npz").exists() and (trdm_dir / "t2_ref_merged.npz").exists():
+        if view_key and view_key != "merged":
+            pred_path = trdm_dir / f"trdm_pred_{view_key}.npz"
+            ref_path = trdm_dir / f"t2_ref_{view_key}.npz"
+        else:
+            pred_path = trdm_dir / "trdm_pred_merged.npz"
+            ref_path = trdm_dir / "t2_ref_merged.npz"
+        with np.load(pred_path) as pred_data:
+            pred_pts = pred_data["points"].astype(np.float32)
+        with np.load(ref_path) as ref_data:
+            ref_pts = ref_data["points"].astype(np.float32)
+        return pred_pts, ref_pts
+
     if view_key and view_key != "merged":
         with np.load(clouds_dir / f"{sample_key}_pred_views.npz") as pred_data:
             pred_pts = pred_data[view_key].astype(np.float32)
