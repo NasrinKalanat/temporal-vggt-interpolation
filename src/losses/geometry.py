@@ -127,6 +127,7 @@ def compute_metrics(
     alpha: float = 0.5,
     beta: float = 0.5,
     compute_normals: bool = True,
+    workers: int = 1,
 ) -> dict[str, float]:
     """Compute all evaluation metrics between predicted and ground-truth point clouds.
 
@@ -151,8 +152,13 @@ def compute_metrics(
     gt_tree = cKDTree(gt_points)
     pred_tree = cKDTree(pred_points)
 
-    pred_to_gt_dist, pred_to_gt_idx = gt_tree.query(pred_points, k=1)
-    gt_to_pred_dist, _ = pred_tree.query(gt_points, k=1)
+    query_kwargs = {"workers": workers} if workers != 1 else {}
+    try:
+        pred_to_gt_dist, pred_to_gt_idx = gt_tree.query(pred_points, k=1, **query_kwargs)
+        gt_to_pred_dist, _ = pred_tree.query(gt_points, k=1, **query_kwargs)
+    except TypeError:
+        pred_to_gt_dist, pred_to_gt_idx = gt_tree.query(pred_points, k=1)
+        gt_to_pred_dist, _ = pred_tree.query(gt_points, k=1)
 
     accuracy = float(np.mean(pred_to_gt_dist))
     completeness = float(np.mean(gt_to_pred_dist))

@@ -21,6 +21,7 @@ image_preprocess_mode: pad
 
 conf_threshold: 0.02
 pred_conf_threshold: 0.0
+eval_stride: 2
 n_points: 50000
 distance_threshold: 0.05
 voxel_size: 0.05
@@ -29,7 +30,13 @@ eval_beta: 0.5
 save_clouds: true
 baselines_only: false
 eval_batch_size: 4
+metric_n_points: 15000
+metric_workers: 1
 compute_normals: false
+save_clouds_compressed: false
+progress_every_variants: 1
+progress_every_views: 1
+progress_every_batches: 1
 shard_wait_poll_s: 10
 shard_wait_timeout_s: 3600
 
